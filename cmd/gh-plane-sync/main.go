@@ -1,3 +1,4 @@
+// Package main is the entrypoint for gh-plane-sync.
 package main
 
 import (
