@@ -37,13 +37,7 @@ plane:
   api_url: "https://plane.example.com"
   workspace: "my-workspace"
 
-mappings:
-  - github:
-      owner: "myorg"
-      repo: "my-project"
-    plane:
-      project_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-
+# Default state mappings (can be overridden per mapping)
 states:
   github_to_plane:
     open: "Backlog"
@@ -54,6 +48,23 @@ states:
     backlog: "open"
     todo: "open"
     in_progress: "open"
+
+mappings:
+  - github:
+      owner: "myorg"
+      repo: "project-a"
+    plane:
+      project_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+  - github:
+      owner: "myorg"
+      repo: "project-b"
+    plane:
+      project_id: "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+    states:  # override for this project
+      plane_to_github:
+        shipped: "closed"
+        triage: "open"
 
 db_path: "./sync.db"
 ```

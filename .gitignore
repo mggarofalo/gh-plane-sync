@@ -1,5 +1,5 @@
 # Binaries
-gh-plane-sync
+/gh-plane-sync
 *.exe
 *.exe~
 *.dll
