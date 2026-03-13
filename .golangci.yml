@@ -20,6 +20,3 @@ linters:
     - unparam
     - unused
 
-issues:
-  exclude-dirs:
-    - vendor
