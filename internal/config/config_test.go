@@ -401,6 +401,24 @@ mappings:
 			wantErr: "interval 30s is below minimum 1m0s",
 		},
 		{
+			name: "interval zero is rejected",
+			yaml: `
+plane:
+  api_url: "https://example.com"
+  workspace: "ws"
+interval: "0s"
+states:
+  github_to_plane:
+    open: "Backlog"
+  plane_to_github:
+    backlog: "open"
+mappings:
+  - github: {owner: "o", repo: "r"}
+    plane: {project_id: "id"}
+`,
+			wantErr: "interval 0s is below minimum 1m0s",
+		},
+		{
 			name: "invalid interval format",
 			yaml: `
 plane:

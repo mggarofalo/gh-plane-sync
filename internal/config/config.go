@@ -33,9 +33,13 @@ type Config struct {
 }
 
 // Duration wraps time.Duration to support YAML unmarshalling from a Go
-// duration string (e.g. "30m", "1h30m", "90s").
+// duration string (e.g. "30m", "1h30m", "90s"). The wasSet field tracks
+// whether the value was explicitly provided in the YAML, allowing Load()
+// to distinguish "not specified" (apply default) from "explicitly set to 0s"
+// (reject as below minimum).
 type Duration struct {
 	time.Duration
+	wasSet bool
 }
 
 // UnmarshalYAML parses a YAML string as a Go time.Duration.
@@ -48,6 +52,7 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 		return fmt.Errorf("parsing duration %q: %w", value.Value, err)
 	}
 	d.Duration = parsed
+	d.wasSet = true
 	return nil
 }
 
@@ -109,7 +114,7 @@ func Load(path string) (*Config, error) {
 		cfg.DBPath = DefaultDBPath
 	}
 
-	if cfg.Interval.Duration == 0 {
+	if !cfg.Interval.wasSet {
 		cfg.Interval.Duration = DefaultInterval
 	}
 
