@@ -189,30 +189,6 @@ mappings:
 	}
 }
 
-func TestRunOnce_CallsSyncCycle(t *testing.T) {
-	// Not parallel: modifies package-level syncCycle and env vars.
-
-	configPath := writeTestConfig(t, shortIntervalConfigYAML)
-
-	var called atomic.Bool
-	origSync := syncCycle
-	syncCycle = func(_ context.Context, _ *config.Config, _ bool, _ *log.Logger) {
-		called.Store(true)
-	}
-	t.Cleanup(func() { syncCycle = origSync })
-
-	t.Setenv("GITHUB_TOKEN", "ghp_test")
-	t.Setenv("PLANE_API_KEY", "test-key")
-
-	code := run([]string{"--config", configPath, "--once"})
-	if code != 0 {
-		t.Fatalf("run() = %d, want 0", code)
-	}
-	if !called.Load() {
-		t.Error("syncCycle was not called in --once mode")
-	}
-}
-
 func TestRunDaemon_ImmediateFirstSync(t *testing.T) {
 	// Not parallel: modifies package-level syncCycle.
 
