@@ -6,6 +6,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,12 +17,38 @@ const DefaultConfigPath = "/etc/gh-plane-sync/config.yaml"
 // DefaultDBPath is the default path to the SQLite database.
 const DefaultDBPath = "/var/lib/gh-plane-sync/sync.db"
 
+// DefaultInterval is the default sync interval when running in daemon mode.
+const DefaultInterval = 30 * time.Minute
+
+// MinInterval is the minimum allowed sync interval.
+const MinInterval = 1 * time.Minute
+
 // Config is the top-level configuration for gh-plane-sync.
 type Config struct {
 	Plane    PlaneConfig   `yaml:"plane"`
 	States   StateMappings `yaml:"states"`
 	Mappings []Mapping     `yaml:"mappings"`
 	DBPath   string        `yaml:"db_path"`
+	Interval Duration      `yaml:"interval"`
+}
+
+// Duration wraps time.Duration to support YAML unmarshalling from a Go
+// duration string (e.g. "30m", "1h30m", "90s").
+type Duration struct {
+	time.Duration
+}
+
+// UnmarshalYAML parses a YAML string as a Go time.Duration.
+func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
+	if value.Value == "" {
+		return nil
+	}
+	parsed, err := time.ParseDuration(value.Value)
+	if err != nil {
+		return fmt.Errorf("parsing duration %q: %w", value.Value, err)
+	}
+	d.Duration = parsed
+	return nil
 }
 
 // PlaneConfig holds the Plane instance connection details.
@@ -82,6 +109,10 @@ func Load(path string) (*Config, error) {
 		cfg.DBPath = DefaultDBPath
 	}
 
+	if cfg.Interval.Duration == 0 {
+		cfg.Interval.Duration = DefaultInterval
+	}
+
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("validating config: %w", err)
 	}
@@ -92,6 +123,10 @@ func Load(path string) (*Config, error) {
 // validate checks that all required fields are present and that there are no
 // duplicate repository entries.
 func (c *Config) validate() error {
+	if c.Interval.Duration < MinInterval {
+		return fmt.Errorf("interval %s is below minimum %s", c.Interval.Duration, MinInterval)
+	}
+
 	if c.Plane.APIURL == "" {
 		return fmt.Errorf("plane.api_url is required")
 	}

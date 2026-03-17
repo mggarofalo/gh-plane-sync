@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoad(t *testing.T) {
@@ -45,6 +46,9 @@ mappings:
 				}
 				if cfg.DBPath != DefaultDBPath {
 					t.Errorf("DBPath = %q, want default %q", cfg.DBPath, DefaultDBPath)
+				}
+				if cfg.Interval.Duration != DefaultInterval {
+					t.Errorf("Interval = %v, want default %v", cfg.Interval.Duration, DefaultInterval)
 				}
 				if len(cfg.Mappings) != 1 {
 					t.Fatalf("len(Mappings) = %d, want 1", len(cfg.Mappings))
@@ -330,6 +334,89 @@ mappings:
       plane_to_github: {}
 `,
 			wantErr: "mappings[0].states.plane_to_github must not be empty when states is specified",
+		},
+		{
+			name: "custom interval",
+			yaml: `
+plane:
+  api_url: "https://plane.example.com"
+  workspace: "ws"
+interval: "15m"
+states:
+  github_to_plane:
+    open: "Backlog"
+  plane_to_github:
+    backlog: "open"
+mappings:
+  - github: {owner: "o", repo: "r"}
+    plane: {project_id: "id"}
+`,
+			check: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				if cfg.Interval.Duration != 15*time.Minute {
+					t.Errorf("Interval = %v, want %v", cfg.Interval.Duration, 15*time.Minute)
+				}
+			},
+		},
+		{
+			name: "interval with hours",
+			yaml: `
+plane:
+  api_url: "https://plane.example.com"
+  workspace: "ws"
+interval: "1h30m"
+states:
+  github_to_plane:
+    open: "Backlog"
+  plane_to_github:
+    backlog: "open"
+mappings:
+  - github: {owner: "o", repo: "r"}
+    plane: {project_id: "id"}
+`,
+			check: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				want := time.Hour + 30*time.Minute
+				if cfg.Interval.Duration != want {
+					t.Errorf("Interval = %v, want %v", cfg.Interval.Duration, want)
+				}
+			},
+		},
+		{
+			name: "interval below minimum",
+			yaml: `
+plane:
+  api_url: "https://example.com"
+  workspace: "ws"
+interval: "30s"
+states:
+  github_to_plane:
+    open: "Backlog"
+  plane_to_github:
+    backlog: "open"
+mappings:
+  - github: {owner: "o", repo: "r"}
+    plane: {project_id: "id"}
+`,
+			wantErr: "interval 30s is below minimum 1m0s",
+		},
+		{
+			name: "invalid interval format",
+			yaml: `
+plane:
+  api_url: "https://example.com"
+  workspace: "ws"
+interval: "not-a-duration"
+states:
+  github_to_plane:
+    open: "Backlog"
+  plane_to_github:
+    backlog: "open"
+mappings:
+  - github: {owner: "o", repo: "r"}
+    plane: {project_id: "id"}
+`,
+			wantErr: "parsing duration",
 		},
 		{
 			name:    "invalid yaml syntax",

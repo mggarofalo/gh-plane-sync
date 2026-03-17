@@ -34,4 +34,4 @@ USER syncer
 VOLUME ["/etc/gh-plane-sync", "/var/lib/gh-plane-sync"]
 
 ENTRYPOINT ["gh-plane-sync"]
-CMD ["--config", "/etc/gh-plane-sync/config.yaml", "--once"]
+CMD ["--config", "/etc/gh-plane-sync/config.yaml"]
