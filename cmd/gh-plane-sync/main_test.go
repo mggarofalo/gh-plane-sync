@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -12,26 +15,6 @@ import (
 	"github.com/mggarofalo/gh-plane-sync/internal/config"
 	"github.com/mggarofalo/gh-plane-sync/internal/log"
 )
-
-// validConfigYAML is a minimal valid config used across CLI tests.
-const validConfigYAML = `
-plane:
-  api_url: "https://plane.example.com"
-  workspace: "my-workspace"
-states:
-  github_to_plane:
-    open: "Backlog"
-    closed: "Done"
-  plane_to_github:
-    done: "closed"
-    backlog: "open"
-mappings:
-  - github:
-      owner: "org"
-      repo: "repo-a"
-    plane:
-      project_id: "aaaa-bbbb"
-`
 
 // shortIntervalConfigYAML uses a 1m interval (minimum allowed) for daemon tests.
 const shortIntervalConfigYAML = `
@@ -57,7 +40,62 @@ mappings:
 func TestRun(t *testing.T) {
 	// Not parallel: subtests use t.Setenv which modifies process-global state.
 
+	// Stand up a mock GitHub API that returns an empty issue list so that
+	// integration-level tests succeed without real credentials.
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `[]`)
+	}))
+	defer ghServer.Close()
+
+	// Stand up a mock Plane API (not called, but config needs a valid URL).
+	planeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer planeServer.Close()
+
+	// Build a config that points to the mock servers and a temp DB path.
+	validConfigYAML := fmt.Sprintf(`
+plane:
+  api_url: %q
+  workspace: "my-workspace"
+states:
+  github_to_plane:
+    open: "Backlog"
+    closed: "Done"
+  plane_to_github:
+    done: "closed"
+    backlog: "open"
+mappings:
+  - github:
+      owner: "org"
+      repo: "repo-a"
+    plane:
+      project_id: "aaaa-bbbb"
+db_path: %q
+`, planeServer.URL, filepath.Join(t.TempDir(), "test.db"))
+
 	configPath := writeTestConfig(t, validConfigYAML)
+
+	// Separate config for tests that don't need mock servers.
+	simpleConfigPath := writeTestConfig(t, `
+plane:
+  api_url: "https://plane.example.com"
+  workspace: "my-workspace"
+states:
+  github_to_plane:
+    open: "Backlog"
+    closed: "Done"
+  plane_to_github:
+    done: "closed"
+    backlog: "open"
+mappings:
+  - github:
+      owner: "org"
+      repo: "repo-a"
+    plane:
+      project_id: "aaaa-bbbb"
+`)
 
 	tests := []struct {
 		name     string
@@ -77,13 +115,13 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name:     "missing GITHUB_TOKEN",
-			args:     []string{"--config", configPath},
+			args:     []string{"--config", simpleConfigPath},
 			envVars:  map[string]string{"PLANE_API_KEY": "test-key"},
 			wantCode: 1,
 		},
 		{
 			name:     "missing PLANE_API_KEY",
-			args:     []string{"--config", configPath},
+			args:     []string{"--config", simpleConfigPath},
 			envVars:  map[string]string{"GITHUB_TOKEN": "ghp_test"},
 			wantCode: 1,
 		},
@@ -91,8 +129,9 @@ func TestRun(t *testing.T) {
 			name: "valid config with env vars and once flag",
 			args: []string{"--config", configPath, "--once"},
 			envVars: map[string]string{
-				"GITHUB_TOKEN":  "ghp_test",
-				"PLANE_API_KEY": "test-key",
+				"GITHUB_TOKEN":        "ghp_test",
+				"PLANE_API_KEY":       "test-key",
+				"GITHUB_API_BASE_URL": ghServer.URL,
 			},
 			wantCode: 0,
 		},
@@ -100,8 +139,19 @@ func TestRun(t *testing.T) {
 			name: "dry-run flag accepted",
 			args: []string{"--config", configPath, "--dry-run", "--once"},
 			envVars: map[string]string{
-				"GITHUB_TOKEN":  "ghp_test",
-				"PLANE_API_KEY": "test-key",
+				"GITHUB_TOKEN":        "ghp_test",
+				"PLANE_API_KEY":       "test-key",
+				"GITHUB_API_BASE_URL": ghServer.URL,
+			},
+			wantCode: 0,
+		},
+		{
+			name: "once flag accepted",
+			args: []string{"--config", configPath, "--once"},
+			envVars: map[string]string{
+				"GITHUB_TOKEN":        "ghp_test",
+				"PLANE_API_KEY":       "test-key",
+				"GITHUB_API_BASE_URL": ghServer.URL,
 			},
 			wantCode: 0,
 		},
@@ -126,6 +176,7 @@ func TestRun(t *testing.T) {
 			// Not parallel: t.Setenv modifies process-global state.
 			t.Setenv("GITHUB_TOKEN", "")
 			t.Setenv("PLANE_API_KEY", "")
+			t.Setenv("GITHUB_API_BASE_URL", "")
 			for k, v := range tt.envVars {
 				t.Setenv(k, v)
 			}
@@ -141,7 +192,7 @@ func TestRun(t *testing.T) {
 func TestRunOnce_CallsSyncCycle(t *testing.T) {
 	// Not parallel: modifies package-level syncCycle and env vars.
 
-	configPath := writeTestConfig(t, validConfigYAML)
+	configPath := writeTestConfig(t, shortIntervalConfigYAML)
 
 	var called atomic.Bool
 	origSync := syncCycle

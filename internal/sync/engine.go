@@ -1,0 +1,292 @@
+// Package sync orchestrates the GitHub-to-Plane issue synchronization cycle.
+// It fetches open issues from configured GitHub repositories and creates or
+// updates corresponding Plane work items, persisting mappings in SQLite.
+package sync
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/mggarofalo/gh-plane-sync/internal/config"
+	"github.com/mggarofalo/gh-plane-sync/internal/log"
+	"github.com/mggarofalo/gh-plane-sync/internal/store"
+)
+
+// GitHubClient is the subset of the GitHub API needed by the sync engine.
+type GitHubClient interface {
+	ListIssues(ctx context.Context, owner, repo string, since time.Time) ([]GitHubIssue, error)
+}
+
+// GitHubIssue mirrors the fields the engine needs from a GitHub issue.
+type GitHubIssue struct {
+	Number    int
+	Title     string
+	Body      string
+	State     string
+	HTMLURL   string
+	UpdatedAt time.Time
+}
+
+// PlaneClient is the subset of the Plane API needed by the sync engine.
+type PlaneClient interface {
+	CreateIssue(ctx context.Context, workspaceSlug, projectID string, req CreatePlaneIssueRequest) (PlaneIssue, error)
+	UpdateIssue(ctx context.Context, workspaceSlug, projectID, issueID string, req UpdatePlaneIssueRequest) (PlaneIssue, error)
+}
+
+// PlaneIssue mirrors the fields the engine needs from a Plane work item.
+type PlaneIssue struct {
+	ID              string
+	Name            string
+	DescriptionHTML string
+}
+
+// CreatePlaneIssueRequest contains the fields for creating a Plane work item.
+type CreatePlaneIssueRequest struct {
+	Name            string `json:"name"`
+	DescriptionHTML string `json:"description_html,omitempty"`
+}
+
+// UpdatePlaneIssueRequest contains the fields for updating a Plane work item.
+type UpdatePlaneIssueRequest struct {
+	Name            string `json:"name,omitempty"`
+	DescriptionHTML string `json:"description_html,omitempty"`
+}
+
+// Engine orchestrates the sync cycle between GitHub and Plane.
+type Engine struct {
+	github GitHubClient
+	plane  PlaneClient
+	store  *store.Store
+	logger *log.Logger
+	cfg    *config.Config
+}
+
+// NewEngine creates a sync engine with the given dependencies.
+func NewEngine(gh GitHubClient, pl PlaneClient, st *store.Store, logger *log.Logger, cfg *config.Config) *Engine {
+	return &Engine{
+		github: gh,
+		plane:  pl,
+		store:  st,
+		logger: logger,
+		cfg:    cfg,
+	}
+}
+
+// SyncIssues runs one cycle of GitHub-to-Plane issue synchronization.
+// For each configured mapping it:
+//  1. Fetches open GitHub issues (using the stored since timestamp).
+//  2. Creates Plane work items for unmapped issues.
+//  3. Updates Plane work items for mapped issues whose title or body changed.
+//  4. Persists mappings and updates the sync-state timestamp.
+func (e *Engine) SyncIssues(ctx context.Context) error {
+	for _, mapping := range e.cfg.Mappings {
+		if err := e.syncRepo(ctx, mapping); err != nil {
+			return fmt.Errorf("syncing %s/%s: %w", mapping.GitHub.Owner, mapping.GitHub.Repo, err)
+		}
+	}
+	return nil
+}
+
+// syncRepo processes a single GitHub-repo-to-Plane-project mapping.
+func (e *Engine) syncRepo(ctx context.Context, mapping config.Mapping) error {
+	owner := mapping.GitHub.Owner
+	repo := mapping.GitHub.Repo
+
+	e.logger.Info("starting issue sync",
+		"owner", owner,
+		"repo", repo,
+		"plane_project", mapping.Plane.ProjectID,
+	)
+
+	// Determine the "since" timestamp from the last successful sync.
+	since, err := e.lastSyncedAt(owner, repo)
+	if err != nil {
+		return fmt.Errorf("getting last sync time: %w", err)
+	}
+
+	if !since.IsZero() {
+		e.logger.Debug("fetching issues since last sync",
+			"owner", owner,
+			"repo", repo,
+			"since", since.Format(time.RFC3339),
+		)
+	}
+
+	issues, err := e.github.ListIssues(ctx, owner, repo, since)
+	if err != nil {
+		return fmt.Errorf("listing GitHub issues: %w", err)
+	}
+
+	e.logger.Info("fetched GitHub issues",
+		"owner", owner,
+		"repo", repo,
+		"count", len(issues),
+	)
+
+	syncTime := time.Now().UTC()
+
+	for _, issue := range issues {
+		if err := e.syncIssue(ctx, mapping, issue); err != nil {
+			e.logger.Error("failed to sync issue",
+				"owner", owner,
+				"repo", repo,
+				"issue_number", issue.Number,
+				"error", err,
+			)
+			// Continue syncing other issues rather than aborting the whole repo.
+			continue
+		}
+	}
+
+	// Update the sync-state timestamp after processing all issues.
+	if err := e.store.UpsertSyncState(store.SyncState{
+		GitHubOwner:  owner,
+		GitHubRepo:   repo,
+		LastSyncedAt: syncTime,
+	}); err != nil {
+		return fmt.Errorf("updating sync state: %w", err)
+	}
+
+	return nil
+}
+
+// syncIssue handles a single GitHub issue: creates or updates the
+// corresponding Plane work item.
+func (e *Engine) syncIssue(ctx context.Context, mapping config.Mapping, issue GitHubIssue) error {
+	owner := mapping.GitHub.Owner
+	repo := mapping.GitHub.Repo
+
+	existing, err := e.store.GetIssueMap(owner, repo, issue.Number)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("looking up issue map: %w", err)
+	}
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return e.createPlaneIssue(ctx, mapping, issue)
+	}
+
+	return e.updatePlaneIssue(ctx, mapping, issue, existing)
+}
+
+// createPlaneIssue creates a new Plane work item for an unmapped GitHub issue.
+func (e *Engine) createPlaneIssue(ctx context.Context, mapping config.Mapping, issue GitHubIssue) error {
+	owner := mapping.GitHub.Owner
+	repo := mapping.GitHub.Repo
+	descHTML := buildDescription(issue.Body, issue.HTMLURL)
+
+	e.logger.LogAction(log.ActionIssueCreated, "creating Plane issue",
+		"owner", owner,
+		"repo", repo,
+		"issue_number", issue.Number,
+		"title", issue.Title,
+	)
+
+	if e.logger.DryRun() {
+		return nil
+	}
+
+	planeIssue, err := e.plane.CreateIssue(ctx, e.cfg.Plane.Workspace, mapping.Plane.ProjectID, CreatePlaneIssueRequest{
+		Name:            issue.Title,
+		DescriptionHTML: descHTML,
+	})
+	if err != nil {
+		return fmt.Errorf("creating Plane issue for %s/%s#%d: %w", owner, repo, issue.Number, err)
+	}
+
+	if err := e.store.UpsertIssueMap(store.IssueMap{
+		GitHubOwner:       owner,
+		GitHubRepo:        repo,
+		GitHubIssueNumber: issue.Number,
+		PlaneProjectID:    mapping.Plane.ProjectID,
+		PlaneIssueID:      planeIssue.ID,
+	}); err != nil {
+		return fmt.Errorf("storing issue map for %s/%s#%d: %w", owner, repo, issue.Number, err)
+	}
+
+	e.logger.Debug("created Plane issue",
+		"owner", owner,
+		"repo", repo,
+		"issue_number", issue.Number,
+		"plane_issue_id", planeIssue.ID,
+	)
+
+	return nil
+}
+
+// updatePlaneIssue updates an existing Plane work item if the GitHub issue's
+// title or body has changed.
+func (e *Engine) updatePlaneIssue(ctx context.Context, mapping config.Mapping, issue GitHubIssue, existing store.IssueMap) error {
+	owner := mapping.GitHub.Owner
+	repo := mapping.GitHub.Repo
+	descHTML := buildDescription(issue.Body, issue.HTMLURL)
+
+	// Check if the issue was updated after our last sync of this mapping.
+	if !issue.UpdatedAt.After(existing.UpdatedAt) {
+		e.logger.LogAction(log.ActionSkipped, "issue unchanged since last sync",
+			"owner", owner,
+			"repo", repo,
+			"issue_number", issue.Number,
+		)
+		return nil
+	}
+
+	e.logger.LogAction(log.ActionIssueUpdated, "updating Plane issue",
+		"owner", owner,
+		"repo", repo,
+		"issue_number", issue.Number,
+		"plane_issue_id", existing.PlaneIssueID,
+		"title", issue.Title,
+	)
+
+	if e.logger.DryRun() {
+		return nil
+	}
+
+	_, err := e.plane.UpdateIssue(ctx, e.cfg.Plane.Workspace, mapping.Plane.ProjectID, existing.PlaneIssueID, UpdatePlaneIssueRequest{
+		Name:            issue.Title,
+		DescriptionHTML: descHTML,
+	})
+	if err != nil {
+		return fmt.Errorf("updating Plane issue for %s/%s#%d: %w", owner, repo, issue.Number, err)
+	}
+
+	// Touch the mapping's updated_at so we can skip it next cycle if unchanged.
+	if err := e.store.UpsertIssueMap(store.IssueMap{
+		GitHubOwner:       owner,
+		GitHubRepo:        repo,
+		GitHubIssueNumber: issue.Number,
+		PlaneProjectID:    mapping.Plane.ProjectID,
+		PlaneIssueID:      existing.PlaneIssueID,
+		CreatedAt:         existing.CreatedAt,
+	}); err != nil {
+		return fmt.Errorf("updating issue map for %s/%s#%d: %w", owner, repo, issue.Number, err)
+	}
+
+	return nil
+}
+
+// lastSyncedAt retrieves the last-synced timestamp for a repo, returning
+// the zero time if no prior sync has been recorded.
+func (e *Engine) lastSyncedAt(owner, repo string) (time.Time, error) {
+	state, err := e.store.GetSyncState(owner, repo)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return state.LastSyncedAt, nil
+}
+
+// buildDescription creates the Plane issue description HTML, incorporating
+// the original GitHub issue body and a link back to the GitHub issue.
+func buildDescription(body, htmlURL string) string {
+	link := fmt.Sprintf(`<p><a href="%s">View on GitHub</a></p>`, htmlURL)
+	if body == "" {
+		return link
+	}
+	return fmt.Sprintf("<p>%s</p>\n%s", body, link)
+}
