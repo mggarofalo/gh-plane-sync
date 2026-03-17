@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"html"
 	"time"
 
 	"github.com/mggarofalo/gh-plane-sync/internal/config"
@@ -127,6 +128,7 @@ func (e *Engine) syncRepo(ctx context.Context, mapping config.Mapping) error {
 	)
 
 	syncTime := time.Now().UTC()
+	hadFailure := false
 
 	for _, issue := range issues {
 		if err := e.syncIssue(ctx, mapping, issue); err != nil {
@@ -136,12 +138,23 @@ func (e *Engine) syncRepo(ctx context.Context, mapping config.Mapping) error {
 				"issue_number", issue.Number,
 				"error", err,
 			)
+			hadFailure = true
 			// Continue syncing other issues rather than aborting the whole repo.
 			continue
 		}
 	}
 
-	// Update the sync-state timestamp after processing all issues.
+	// Only advance the sync-state timestamp when all issues were processed
+	// successfully. If any issue failed, we leave the timestamp unchanged
+	// so that the next cycle re-fetches those issues from GitHub.
+	if hadFailure {
+		e.logger.Warn("skipping sync state update due to failures",
+			"owner", owner,
+			"repo", repo,
+		)
+		return nil
+	}
+
 	if err := e.store.UpsertSyncState(store.SyncState{
 		GitHubOwner:  owner,
 		GitHubRepo:   repo,
@@ -283,10 +296,11 @@ func (e *Engine) lastSyncedAt(owner, repo string) (time.Time, error) {
 
 // buildDescription creates the Plane issue description HTML, incorporating
 // the original GitHub issue body and a link back to the GitHub issue.
+// The body is HTML-escaped to prevent XSS from user-controlled content.
 func buildDescription(body, htmlURL string) string {
-	link := fmt.Sprintf(`<p><a href="%s">View on GitHub</a></p>`, htmlURL)
+	link := fmt.Sprintf(`<p><a href="%s">View on GitHub</a></p>`, html.EscapeString(htmlURL))
 	if body == "" {
 		return link
 	}
-	return fmt.Sprintf("<p>%s</p>\n%s", body, link)
+	return fmt.Sprintf("<p>%s</p>\n%s", html.EscapeString(body), link)
 }

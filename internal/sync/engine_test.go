@@ -396,6 +396,12 @@ func TestBuildDescription(t *testing.T) {
 			htmlURL: "https://github.com/o/r/issues/2",
 			want:    "<p><a href=\"https://github.com/o/r/issues/2\">View on GitHub</a></p>",
 		},
+		{
+			name:    "body with HTML is escaped",
+			body:    `</p><script>alert("xss")</script><p>`,
+			htmlURL: "https://github.com/o/r/issues/3",
+			want:    "<p>&lt;/p&gt;&lt;script&gt;alert(&#34;xss&#34;)&lt;/script&gt;&lt;p&gt;</p>\n<p><a href=\"https://github.com/o/r/issues/3\">View on GitHub</a></p>",
+		},
 	}
 
 	for _, tc := range tests {
@@ -434,6 +440,46 @@ func TestSyncIssuesUsesLastSyncedTimestamp(t *testing.T) {
 
 	if !capturedSince.Equal(lastSync) {
 		t.Errorf("since = %v, want %v", capturedSince, lastSync)
+	}
+}
+
+func TestSyncIssuesDoesNotAdvanceSyncStateOnFailure(t *testing.T) {
+	now := time.Now().UTC()
+	st := testStore(t)
+	logger := testLogger(false)
+
+	// Seed a sync state so we can verify it doesn't advance.
+	originalSync := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := st.UpsertSyncState(store.SyncState{
+		GitHubOwner:  "owner",
+		GitHubRepo:   "repo",
+		LastSyncedAt: originalSync,
+	}); err != nil {
+		t.Fatalf("seeding sync state: %v", err)
+	}
+
+	gh := &mockGitHubClient{
+		issues: map[string][]GitHubIssue{
+			"owner/repo": {
+				{Number: 1, Title: "Bug", Body: "", State: "open", HTMLURL: "https://github.com/owner/repo/issues/1", UpdatedAt: now},
+			},
+		},
+	}
+	pl := &mockPlaneClient{err: fmt.Errorf("Plane API unavailable")}
+
+	engine := NewEngine(gh, pl, st, logger, testConfig())
+	// Should not return error (per-issue failures are logged, not propagated).
+	if err := engine.SyncIssues(context.Background()); err != nil {
+		t.Fatalf("SyncIssues: %v", err)
+	}
+
+	// Verify sync state was NOT advanced past the original timestamp.
+	state, err := st.GetSyncState("owner", "repo")
+	if err != nil {
+		t.Fatalf("GetSyncState: %v", err)
+	}
+	if !state.LastSyncedAt.Equal(originalSync) {
+		t.Errorf("LastSyncedAt = %v, want %v (should not advance on failure)", state.LastSyncedAt, originalSync)
 	}
 }
 
