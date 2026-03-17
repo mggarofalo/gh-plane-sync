@@ -73,6 +73,28 @@ func (a *GitHubAdapter) ListIssues(ctx context.Context, owner, repo string, sinc
 	return result, nil
 }
 
+// ListComments fetches comments via the underlying GitHub client and converts
+// them to the sync package's GitHubComment type.
+func (a *GitHubAdapter) ListComments(ctx context.Context, owner, repo string, issueNumber int) ([]GitHubComment, error) {
+	comments, err := a.client.ListComments(ctx, owner, repo, issueNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]GitHubComment, len(comments))
+	for i, c := range comments {
+		result[i] = GitHubComment{
+			ID:        c.ID,
+			Body:      c.Body,
+			User:      c.User.Login,
+			CreatedAt: c.CreatedAt,
+			HTMLURL:   c.HTMLURL,
+		}
+	}
+
+	return result, nil
+}
+
 // PlaneAdapter adapts a plane.Client to the sync.PlaneClient interface.
 type PlaneAdapter struct {
 	client plane.Client
@@ -131,5 +153,20 @@ func (a *PlaneAdapter) UpdateIssue(ctx context.Context, workspaceSlug, projectID
 		ID:              issue.ID,
 		Name:            issue.Name,
 		DescriptionHTML: issue.DescriptionHTML,
+	}, nil
+}
+
+// CreateComment creates a comment via the underlying Plane client and converts
+// the response to the sync package's PlaneComment type.
+func (a *PlaneAdapter) CreateComment(ctx context.Context, workspaceSlug, projectID, issueID string, req CreatePlaneCommentRequest) (PlaneComment, error) {
+	comment, err := a.client.CreateComment(ctx, workspaceSlug, projectID, issueID, plane.CreateCommentRequest{
+		CommentHTML: req.CommentHTML,
+	})
+	if err != nil {
+		return PlaneComment{}, err
+	}
+
+	return PlaneComment{
+		ID: comment.ID,
 	}, nil
 }

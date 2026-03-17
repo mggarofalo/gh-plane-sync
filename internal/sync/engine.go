@@ -23,6 +23,7 @@ type GitHubClient interface {
 	CloseIssue(ctx context.Context, owner, repo string, number int) error
 	ReopenIssue(ctx context.Context, owner, repo string, number int) error
 	CreateComment(ctx context.Context, owner, repo string, number int, body string) error
+	ListComments(ctx context.Context, owner, repo string, issueNumber int) ([]GitHubComment, error)
 }
 
 // GitHubIssue mirrors the fields the engine needs from a GitHub issue.
@@ -35,11 +36,21 @@ type GitHubIssue struct {
 	UpdatedAt time.Time
 }
 
+// GitHubComment mirrors the fields the engine needs from a GitHub comment.
+type GitHubComment struct {
+	ID        int
+	Body      string
+	User      string
+	CreatedAt time.Time
+	HTMLURL   string
+}
+
 // PlaneClient is the subset of the Plane API needed by the sync engine.
 type PlaneClient interface {
 	GetIssue(ctx context.Context, workspaceSlug, projectID, issueID string) (PlaneIssue, error)
 	CreateIssue(ctx context.Context, workspaceSlug, projectID string, req CreatePlaneIssueRequest) (PlaneIssue, error)
 	UpdateIssue(ctx context.Context, workspaceSlug, projectID, issueID string, req UpdatePlaneIssueRequest) (PlaneIssue, error)
+	CreateComment(ctx context.Context, workspaceSlug, projectID, issueID string, req CreatePlaneCommentRequest) (PlaneComment, error)
 }
 
 // PlaneIssue mirrors the fields the engine needs from a Plane work item.
@@ -60,6 +71,16 @@ type CreatePlaneIssueRequest struct {
 type UpdatePlaneIssueRequest struct {
 	Name            string `json:"name,omitempty"`
 	DescriptionHTML string `json:"description_html,omitempty"`
+}
+
+// PlaneComment mirrors the fields the engine needs from a Plane comment.
+type PlaneComment struct {
+	ID string
+}
+
+// CreatePlaneCommentRequest contains the fields for creating a Plane comment.
+type CreatePlaneCommentRequest struct {
+	CommentHTML string `json:"comment_html"`
 }
 
 // Engine orchestrates the sync cycle between GitHub and Plane.
@@ -450,4 +471,136 @@ func buildDescription(body, htmlURL string) string {
 		return link
 	}
 	return fmt.Sprintf("<p>%s</p>\n%s", html.EscapeString(body), link)
+}
+
+// SyncComments runs one cycle of GitHub-to-Plane comment synchronization.
+// For each configured mapping it iterates over all mapped issues, fetches
+// their GitHub comments, and creates Plane comments for any not yet synced.
+// Comments are append-only: existing synced comments are never updated or
+// deleted.
+func (e *Engine) SyncComments(ctx context.Context) error {
+	for _, mapping := range e.cfg.Mappings {
+		if err := e.syncRepoComments(ctx, mapping); err != nil {
+			return fmt.Errorf("syncing comments for %s/%s: %w", mapping.GitHub.Owner, mapping.GitHub.Repo, err)
+		}
+	}
+	return nil
+}
+
+// syncRepoComments syncs comments for all mapped issues in a single repo.
+func (e *Engine) syncRepoComments(ctx context.Context, mapping config.Mapping) error {
+	owner := mapping.GitHub.Owner
+	repo := mapping.GitHub.Repo
+
+	issueMaps, err := e.store.ListIssueMaps(owner, repo)
+	if err != nil {
+		return fmt.Errorf("listing issue maps: %w", err)
+	}
+
+	if len(issueMaps) == 0 {
+		e.logger.Debug("no mapped issues, skipping comment sync",
+			"owner", owner,
+			"repo", repo,
+		)
+		return nil
+	}
+
+	e.logger.Info("starting comment sync",
+		"owner", owner,
+		"repo", repo,
+		"mapped_issues", len(issueMaps),
+	)
+
+	for _, im := range issueMaps {
+		if err := e.syncIssueComments(ctx, mapping, im); err != nil {
+			e.logger.Error("failed to sync comments for issue",
+				"owner", owner,
+				"repo", repo,
+				"issue_number", im.GitHubIssueNumber,
+				"error", err,
+			)
+			// Continue syncing other issues rather than aborting.
+			continue
+		}
+	}
+
+	return nil
+}
+
+// syncIssueComments syncs comments for a single GitHub issue.
+func (e *Engine) syncIssueComments(ctx context.Context, mapping config.Mapping, im store.IssueMap) error {
+	owner := mapping.GitHub.Owner
+	repo := mapping.GitHub.Repo
+
+	comments, err := e.github.ListComments(ctx, owner, repo, im.GitHubIssueNumber)
+	if err != nil {
+		return fmt.Errorf("listing GitHub comments for %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
+	}
+
+	for _, comment := range comments {
+		_, err := e.store.GetSyncedComment(comment.ID)
+		if err == nil {
+			// Already synced — skip.
+			continue
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("checking synced comment %d: %w", comment.ID, err)
+		}
+
+		// Not yet synced — create on Plane.
+		commentHTML := buildCommentBody(comment)
+
+		e.logger.LogAction(log.ActionCommentSynced, "syncing comment to Plane",
+			"owner", owner,
+			"repo", repo,
+			"issue_number", im.GitHubIssueNumber,
+			"github_comment_id", comment.ID,
+			"author", comment.User,
+		)
+
+		if e.logger.DryRun() {
+			continue
+		}
+
+		planeComment, err := e.plane.CreateComment(ctx, e.cfg.Plane.Workspace, mapping.Plane.ProjectID, im.PlaneIssueID, CreatePlaneCommentRequest{
+			CommentHTML: commentHTML,
+		})
+		if err != nil {
+			return fmt.Errorf("creating Plane comment for GitHub comment %d: %w", comment.ID, err)
+		}
+
+		if err := e.store.UpsertSyncedComment(store.SyncedComment{
+			GitHubCommentID:   comment.ID,
+			PlaneCommentID:    planeComment.ID,
+			GitHubIssueNumber: im.GitHubIssueNumber,
+			GitHubOwner:       owner,
+			GitHubRepo:        repo,
+		}); err != nil {
+			return fmt.Errorf("storing synced comment %d: %w", comment.ID, err)
+		}
+
+		e.logger.Debug("synced comment",
+			"owner", owner,
+			"repo", repo,
+			"issue_number", im.GitHubIssueNumber,
+			"github_comment_id", comment.ID,
+			"plane_comment_id", planeComment.ID,
+		)
+	}
+
+	return nil
+}
+
+// buildCommentBody creates the Plane comment HTML body from a GitHub comment,
+// including the author, timestamp, and a link back to the original comment.
+// User-controlled content is HTML-escaped to prevent XSS.
+func buildCommentBody(c GitHubComment) string {
+	timestamp := c.CreatedAt.UTC().Format(time.RFC3339)
+	return fmt.Sprintf(
+		"<p><strong>%s</strong> commented on %s (<a href=\"%s\">view on GitHub</a>):</p>\n<blockquote>%s</blockquote>",
+		html.EscapeString(c.User),
+		html.EscapeString(timestamp),
+		html.EscapeString(c.HTMLURL),
+		html.EscapeString(c.Body),
+	)
 }

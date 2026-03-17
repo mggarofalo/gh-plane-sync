@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,16 +18,18 @@ import (
 
 // mockGitHubClient implements GitHubClient for testing.
 type mockGitHubClient struct {
-	issues       map[string][]GitHubIssue // key: "owner/repo"
-	issuesByNum  map[string]GitHubIssue   // key: "owner/repo#number"
-	closedIssues []string                 // "owner/repo#number"
-	reopened     []string                 // "owner/repo#number"
-	comments     []commentCall
-	err          error
-	getIssueErr  error
-	closeErr     error
-	reopenErr    error
-	commentErr   error
+	issues        map[string][]GitHubIssue   // key: "owner/repo"
+	issuesByNum   map[string]GitHubIssue     // key: "owner/repo#number"
+	closedIssues  []string                   // "owner/repo#number"
+	reopened      []string                   // "owner/repo#number"
+	comments      map[string][]GitHubComment // key: "owner/repo#number" (for ListComments)
+	stateComments []commentCall              // (for CreateComment tracking)
+	err           error
+	getIssueErr   error
+	closeErr      error
+	reopenErr     error
+	commentErr    error // used by CreateComment (state sync)
+	listCommentErr error // used by ListComments (comment sync)
 }
 
 type commentCall struct {
@@ -78,23 +81,39 @@ func (m *mockGitHubClient) CreateComment(_ context.Context, owner, repo string, 
 	if m.commentErr != nil {
 		return m.commentErr
 	}
-	m.comments = append(m.comments, commentCall{owner: owner, repo: repo, number: number, body: body})
+	m.stateComments = append(m.stateComments, commentCall{owner: owner, repo: repo, number: number, body: body})
 	return nil
+}
+
+func (m *mockGitHubClient) ListComments(_ context.Context, owner, repo string, issueNumber int) ([]GitHubComment, error) {
+	if m.listCommentErr != nil {
+		return nil, m.listCommentErr
+	}
+	key := fmt.Sprintf("%s/%s#%d", owner, repo, issueNumber)
+	return m.comments[key], nil
 }
 
 // mockPlaneClient implements PlaneClient for testing.
 type mockPlaneClient struct {
-	created     []CreatePlaneIssueRequest
-	updated     []updateCall
-	nextID      int
-	err         error
-	getIssueErr error
-	planeIssues map[string]PlaneIssue // key: issueID
+	created         []CreatePlaneIssueRequest
+	updated         []updateCall
+	createdComments []createCommentCall
+	nextID          int
+	nextCommentID   int
+	err             error
+	commentErr      error
+	getIssueErr     error
+	planeIssues     map[string]PlaneIssue // key: issueID
 }
 
 type updateCall struct {
 	issueID string
 	req     UpdatePlaneIssueRequest
+}
+
+type createCommentCall struct {
+	issueID string
+	req     CreatePlaneCommentRequest
 }
 
 func (m *mockPlaneClient) GetIssue(_ context.Context, _, _, issueID string) (PlaneIssue, error) {
@@ -132,6 +151,16 @@ func (m *mockPlaneClient) UpdateIssue(_ context.Context, _, _, issueID string, r
 		Name:            req.Name,
 		DescriptionHTML: req.DescriptionHTML,
 	}, nil
+}
+
+func (m *mockPlaneClient) CreateComment(_ context.Context, _, _, issueID string, req CreatePlaneCommentRequest) (PlaneComment, error) {
+	if m.commentErr != nil {
+		return PlaneComment{}, m.commentErr
+	}
+	m.nextCommentID++
+	id := fmt.Sprintf("plane-comment-%d", m.nextCommentID)
+	m.createdComments = append(m.createdComments, createCommentCall{issueID: issueID, req: req})
+	return PlaneComment{ID: id}, nil
 }
 
 // testStore creates a temporary SQLite store for testing.
@@ -575,6 +604,10 @@ func (m *mockGitHubClientWithSince) CreateComment(_ context.Context, _, _ string
 	return nil
 }
 
+func (m *mockGitHubClientWithSince) ListComments(_ context.Context, _, _ string, _ int) ([]GitHubComment, error) {
+	return nil, nil
+}
+
 // testStateConfig returns a config with full state mappings for state sync tests.
 func testStateConfig() *config.Config {
 	return &config.Config{
@@ -891,8 +924,8 @@ func TestSyncStates(t *testing.T) {
 			if len(gh.reopened) != tc.wantReopened {
 				t.Errorf("reopened %d issues, want %d", len(gh.reopened), tc.wantReopened)
 			}
-			if len(gh.comments) != tc.wantComments {
-				t.Errorf("created %d comments, want %d", len(gh.comments), tc.wantComments)
+			if len(gh.stateComments) != tc.wantComments {
+				t.Errorf("created %d comments, want %d", len(gh.stateComments), tc.wantComments)
 			}
 		})
 	}
@@ -928,13 +961,13 @@ func TestSyncStatesCommentContent(t *testing.T) {
 		t.Fatalf("SyncStates: %v", err)
 	}
 
-	if len(gh.comments) != 1 {
-		t.Fatalf("expected 1 comment, got %d", len(gh.comments))
+	if len(gh.stateComments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(gh.stateComments))
 	}
 
 	want := "Closed by Plane workflow (state: Done)"
-	if gh.comments[0].body != want {
-		t.Errorf("comment body = %q, want %q", gh.comments[0].body, want)
+	if gh.stateComments[0].body != want {
+		t.Errorf("comment body = %q, want %q", gh.stateComments[0].body, want)
 	}
 }
 
@@ -968,13 +1001,13 @@ func TestSyncStatesReopenCommentContent(t *testing.T) {
 		t.Fatalf("SyncStates: %v", err)
 	}
 
-	if len(gh.comments) != 1 {
-		t.Fatalf("expected 1 comment, got %d", len(gh.comments))
+	if len(gh.stateComments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(gh.stateComments))
 	}
 
 	want := "Reopened by Plane workflow (state: In Progress)"
-	if gh.comments[0].body != want {
-		t.Errorf("comment body = %q, want %q", gh.comments[0].body, want)
+	if gh.stateComments[0].body != want {
+		t.Errorf("comment body = %q, want %q", gh.stateComments[0].body, want)
 	}
 }
 
@@ -1018,7 +1051,357 @@ func TestSyncStatesDryRunCountsActions(t *testing.T) {
 	if len(gh.closedIssues) != 0 {
 		t.Errorf("dry run should not close issues, got %d", len(gh.closedIssues))
 	}
-	if len(gh.comments) != 0 {
-		t.Errorf("dry run should not create comments, got %d", len(gh.comments))
+	if len(gh.stateComments) != 0 {
+		t.Errorf("dry run should not create comments, got %d", len(gh.stateComments))
+	}
+}
+
+func TestSyncComments(t *testing.T) {
+	now := time.Now().UTC()
+
+	tests := []struct {
+		name                string
+		ghComments          map[string][]GitHubComment
+		seedIssueMaps       []store.IssueMap
+		seedSyncedComments  []store.SyncedComment
+		cfg                 *config.Config
+		dryRun              bool
+		wantCreatedComments int
+		wantErr             bool
+		ghCommentErr        error
+		planeCommentErr     error
+	}{
+		{
+			name: "syncs new comments",
+			ghComments: map[string][]GitHubComment{
+				"owner/repo#1": {
+					{ID: 100, Body: "Hello", User: "alice", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/1#issuecomment-100"},
+					{ID: 101, Body: "World", User: "bob", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/1#issuecomment-101"},
+				},
+			},
+			seedIssueMaps: []store.IssueMap{
+				{GitHubOwner: "owner", GitHubRepo: "repo", GitHubIssueNumber: 1, PlaneProjectID: "proj-1", PlaneIssueID: "plane-issue-1"},
+			},
+			cfg:                 testConfig(),
+			wantCreatedComments: 2,
+		},
+		{
+			name: "skips already synced comments",
+			ghComments: map[string][]GitHubComment{
+				"owner/repo#1": {
+					{ID: 100, Body: "Already synced", User: "alice", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/1#issuecomment-100"},
+					{ID: 101, Body: "New comment", User: "bob", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/1#issuecomment-101"},
+				},
+			},
+			seedIssueMaps: []store.IssueMap{
+				{GitHubOwner: "owner", GitHubRepo: "repo", GitHubIssueNumber: 1, PlaneProjectID: "proj-1", PlaneIssueID: "plane-issue-1"},
+			},
+			seedSyncedComments: []store.SyncedComment{
+				{GitHubCommentID: 100, PlaneCommentID: "existing-plane-comment", GitHubIssueNumber: 1, GitHubOwner: "owner", GitHubRepo: "repo"},
+			},
+			cfg:                 testConfig(),
+			wantCreatedComments: 1,
+		},
+		{
+			name:       "no mapped issues skips gracefully",
+			ghComments: map[string][]GitHubComment{},
+			cfg:        testConfig(),
+		},
+		{
+			name: "no comments on issue",
+			ghComments: map[string][]GitHubComment{
+				"owner/repo#1": {},
+			},
+			seedIssueMaps: []store.IssueMap{
+				{GitHubOwner: "owner", GitHubRepo: "repo", GitHubIssueNumber: 1, PlaneProjectID: "proj-1", PlaneIssueID: "plane-issue-1"},
+			},
+			cfg: testConfig(),
+		},
+		{
+			name: "dry run does not create comments",
+			ghComments: map[string][]GitHubComment{
+				"owner/repo#1": {
+					{ID: 100, Body: "Hello", User: "alice", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/1#issuecomment-100"},
+				},
+			},
+			seedIssueMaps: []store.IssueMap{
+				{GitHubOwner: "owner", GitHubRepo: "repo", GitHubIssueNumber: 1, PlaneProjectID: "proj-1", PlaneIssueID: "plane-issue-1"},
+			},
+			cfg:    testConfig(),
+			dryRun: true,
+		},
+		{
+			name: "github comment error continues to next issue",
+			ghComments: map[string][]GitHubComment{
+				"owner/repo#1": {
+					{ID: 100, Body: "Hello", User: "alice", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/1#issuecomment-100"},
+				},
+			},
+			seedIssueMaps: []store.IssueMap{
+				{GitHubOwner: "owner", GitHubRepo: "repo", GitHubIssueNumber: 1, PlaneProjectID: "proj-1", PlaneIssueID: "plane-issue-1"},
+			},
+			cfg:          testConfig(),
+			ghCommentErr: fmt.Errorf("GitHub API error"),
+			// Per-issue errors are logged, not propagated.
+		},
+		{
+			name: "plane comment error continues to next issue",
+			ghComments: map[string][]GitHubComment{
+				"owner/repo#1": {
+					{ID: 100, Body: "Hello", User: "alice", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/1#issuecomment-100"},
+				},
+			},
+			seedIssueMaps: []store.IssueMap{
+				{GitHubOwner: "owner", GitHubRepo: "repo", GitHubIssueNumber: 1, PlaneProjectID: "proj-1", PlaneIssueID: "plane-issue-1"},
+			},
+			cfg:             testConfig(),
+			planeCommentErr: fmt.Errorf("Plane API error"),
+			// Per-issue errors are logged, not propagated.
+		},
+		{
+			name: "multiple issues with comments",
+			ghComments: map[string][]GitHubComment{
+				"owner/repo#1": {
+					{ID: 100, Body: "Comment on 1", User: "alice", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/1#issuecomment-100"},
+				},
+				"owner/repo#2": {
+					{ID: 200, Body: "Comment on 2", User: "bob", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/2#issuecomment-200"},
+					{ID: 201, Body: "Another on 2", User: "carol", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/2#issuecomment-201"},
+				},
+			},
+			seedIssueMaps: []store.IssueMap{
+				{GitHubOwner: "owner", GitHubRepo: "repo", GitHubIssueNumber: 1, PlaneProjectID: "proj-1", PlaneIssueID: "plane-issue-1"},
+				{GitHubOwner: "owner", GitHubRepo: "repo", GitHubIssueNumber: 2, PlaneProjectID: "proj-1", PlaneIssueID: "plane-issue-2"},
+			},
+			cfg:                 testConfig(),
+			wantCreatedComments: 3,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			logger := testLogger(tc.dryRun)
+			gh := &mockGitHubClient{
+				comments:       tc.ghComments,
+				listCommentErr: tc.ghCommentErr,
+			}
+			pl := &mockPlaneClient{commentErr: tc.planeCommentErr}
+
+			// Seed existing issue maps.
+			for _, m := range tc.seedIssueMaps {
+				if err := st.UpsertIssueMap(m); err != nil {
+					t.Fatalf("seeding issue map: %v", err)
+				}
+			}
+
+			// Seed existing synced comments.
+			for _, c := range tc.seedSyncedComments {
+				if err := st.UpsertSyncedComment(c); err != nil {
+					t.Fatalf("seeding synced comment: %v", err)
+				}
+			}
+
+			engine := NewEngine(gh, pl, st, logger, tc.cfg)
+			err := engine.SyncComments(context.Background())
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SyncComments: %v", err)
+			}
+
+			if len(pl.createdComments) != tc.wantCreatedComments {
+				t.Errorf("created %d comments, want %d", len(pl.createdComments), tc.wantCreatedComments)
+			}
+		})
+	}
+}
+
+func TestSyncCommentsStoresMappings(t *testing.T) {
+	now := time.Now().UTC()
+	st := testStore(t)
+	logger := testLogger(false)
+
+	// Seed an issue map.
+	if err := st.UpsertIssueMap(store.IssueMap{
+		GitHubOwner: "owner", GitHubRepo: "repo", GitHubIssueNumber: 1,
+		PlaneProjectID: "proj-1", PlaneIssueID: "plane-issue-1",
+	}); err != nil {
+		t.Fatalf("seeding issue map: %v", err)
+	}
+
+	gh := &mockGitHubClient{
+		comments: map[string][]GitHubComment{
+			"owner/repo#1": {
+				{ID: 42, Body: "Test comment", User: "alice", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/1#issuecomment-42"},
+			},
+		},
+	}
+	pl := &mockPlaneClient{}
+
+	engine := NewEngine(gh, pl, st, logger, testConfig())
+	if err := engine.SyncComments(context.Background()); err != nil {
+		t.Fatalf("SyncComments: %v", err)
+	}
+
+	// Verify the synced comment was stored.
+	sc, err := st.GetSyncedComment(42)
+	if err != nil {
+		t.Fatalf("GetSyncedComment: %v", err)
+	}
+	if sc.GitHubIssueNumber != 1 {
+		t.Errorf("GitHubIssueNumber = %d, want 1", sc.GitHubIssueNumber)
+	}
+	if sc.PlaneCommentID == "" {
+		t.Error("PlaneCommentID should not be empty")
+	}
+}
+
+func TestSyncCommentsDryRunNoSideEffects(t *testing.T) {
+	now := time.Now().UTC()
+	st := testStore(t)
+	logger := testLogger(true)
+
+	if err := st.UpsertIssueMap(store.IssueMap{
+		GitHubOwner: "owner", GitHubRepo: "repo", GitHubIssueNumber: 1,
+		PlaneProjectID: "proj-1", PlaneIssueID: "plane-issue-1",
+	}); err != nil {
+		t.Fatalf("seeding issue map: %v", err)
+	}
+
+	gh := &mockGitHubClient{
+		comments: map[string][]GitHubComment{
+			"owner/repo#1": {
+				{ID: 100, Body: "Should not sync", User: "alice", CreatedAt: now, HTMLURL: "https://github.com/owner/repo/issues/1#issuecomment-100"},
+			},
+		},
+	}
+	pl := &mockPlaneClient{}
+
+	engine := NewEngine(gh, pl, st, logger, testConfig())
+	if err := engine.SyncComments(context.Background()); err != nil {
+		t.Fatalf("SyncComments: %v", err)
+	}
+
+	// Verify no Plane API calls were made.
+	if len(pl.createdComments) != 0 {
+		t.Errorf("dry run should not create comments, got %d", len(pl.createdComments))
+	}
+
+	// Verify no synced comment was stored.
+	comments, err := st.ListSyncedComments("owner", "repo", 1)
+	if err != nil {
+		t.Fatalf("ListSyncedComments: %v", err)
+	}
+	if len(comments) != 0 {
+		t.Errorf("dry run should not store synced comments, got %d", len(comments))
+	}
+}
+
+func TestSyncCommentsIncludesAuthorAndTimestamp(t *testing.T) {
+	commentTime := time.Date(2025, 6, 15, 10, 30, 0, 0, time.UTC)
+	st := testStore(t)
+	logger := testLogger(false)
+
+	if err := st.UpsertIssueMap(store.IssueMap{
+		GitHubOwner: "owner", GitHubRepo: "repo", GitHubIssueNumber: 1,
+		PlaneProjectID: "proj-1", PlaneIssueID: "plane-issue-1",
+	}); err != nil {
+		t.Fatalf("seeding issue map: %v", err)
+	}
+
+	gh := &mockGitHubClient{
+		comments: map[string][]GitHubComment{
+			"owner/repo#1": {
+				{ID: 100, Body: "Test body", User: "alice", CreatedAt: commentTime, HTMLURL: "https://github.com/owner/repo/issues/1#issuecomment-100"},
+			},
+		},
+	}
+	pl := &mockPlaneClient{}
+
+	engine := NewEngine(gh, pl, st, logger, testConfig())
+	if err := engine.SyncComments(context.Background()); err != nil {
+		t.Fatalf("SyncComments: %v", err)
+	}
+
+	if len(pl.createdComments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(pl.createdComments))
+	}
+
+	body := pl.createdComments[0].req.CommentHTML
+	// Verify the comment body contains the author.
+	if !strings.Contains(body, "alice") {
+		t.Errorf("comment body should contain author 'alice': %s", body)
+	}
+	// Verify the comment body contains the timestamp.
+	if !strings.Contains(body, "2025-06-15T10:30:00Z") {
+		t.Errorf("comment body should contain timestamp: %s", body)
+	}
+	// Verify the comment body contains the original text.
+	if !strings.Contains(body, "Test body") {
+		t.Errorf("comment body should contain original text: %s", body)
+	}
+	// Verify the comment body contains a link.
+	if !strings.Contains(body, "view on GitHub") {
+		t.Errorf("comment body should contain GitHub link: %s", body)
+	}
+}
+
+func TestBuildCommentBody(t *testing.T) {
+	tests := []struct {
+		name    string
+		comment GitHubComment
+		want    string
+	}{
+		{
+			name: "standard comment",
+			comment: GitHubComment{
+				ID:        100,
+				Body:      "Hello world",
+				User:      "alice",
+				CreatedAt: time.Date(2025, 6, 15, 10, 30, 0, 0, time.UTC),
+				HTMLURL:   "https://github.com/o/r/issues/1#issuecomment-100",
+			},
+			want: `<p><strong>alice</strong> commented on 2025-06-15T10:30:00Z (<a href="https://github.com/o/r/issues/1#issuecomment-100">view on GitHub</a>):</p>
+<blockquote>Hello world</blockquote>`,
+		},
+		{
+			name: "body with HTML is escaped",
+			comment: GitHubComment{
+				ID:        200,
+				Body:      `<script>alert("xss")</script>`,
+				User:      "eve",
+				CreatedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+				HTMLURL:   "https://github.com/o/r/issues/1#issuecomment-200",
+			},
+			want: `<p><strong>eve</strong> commented on 2025-01-01T00:00:00Z (<a href="https://github.com/o/r/issues/1#issuecomment-200">view on GitHub</a>):</p>
+<blockquote>&lt;script&gt;alert(&#34;xss&#34;)&lt;/script&gt;</blockquote>`,
+		},
+		{
+			name: "empty body",
+			comment: GitHubComment{
+				ID:        300,
+				Body:      "",
+				User:      "bob",
+				CreatedAt: time.Date(2025, 3, 1, 12, 0, 0, 0, time.UTC),
+				HTMLURL:   "https://github.com/o/r/issues/1#issuecomment-300",
+			},
+			want: `<p><strong>bob</strong> commented on 2025-03-01T12:00:00Z (<a href="https://github.com/o/r/issues/1#issuecomment-300">view on GitHub</a>):</p>
+<blockquote></blockquote>`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildCommentBody(tc.comment)
+			if got != tc.want {
+				t.Errorf("buildCommentBody() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

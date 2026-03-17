@@ -441,6 +441,127 @@ func TestCreateComment(t *testing.T) {
 	}
 }
 
+func TestListComments(t *testing.T) {
+	tests := []struct {
+		name      string
+		handler   http.HandlerFunc
+		wantCount int
+		wantErr   bool
+	}{
+		{
+			name: "returns comments",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `[
+					{"id":100,"body":"First comment","user":{"login":"alice"},"created_at":"2025-01-01T00:00:00Z","html_url":"https://github.com/o/r/issues/1#issuecomment-100"},
+					{"id":101,"body":"Second comment","user":{"login":"bob"},"created_at":"2025-01-02T00:00:00Z","html_url":"https://github.com/o/r/issues/1#issuecomment-101"}
+				]`)
+			},
+			wantCount: 2,
+		},
+		{
+			name: "handles pagination",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				page := r.URL.Query().Get("page")
+				switch page {
+				case "", "1":
+					w.Header().Set("Link", fmt.Sprintf(`<%s/repos/owner/repo/issues/1/comments?page=2>; rel="next"`, "http://"+r.Host))
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprint(w, `[{"id":100,"body":"Page 1","user":{"login":"alice"},"created_at":"2025-01-01T00:00:00Z","html_url":"https://github.com/o/r/issues/1#issuecomment-100"}]`)
+				case "2":
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprint(w, `[{"id":101,"body":"Page 2","user":{"login":"bob"},"created_at":"2025-01-02T00:00:00Z","html_url":"https://github.com/o/r/issues/1#issuecomment-101"}]`)
+				default:
+					w.WriteHeader(http.StatusBadRequest)
+				}
+			},
+			wantCount: 2,
+		},
+		{
+			name: "empty response",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `[]`)
+			},
+			wantCount: 0,
+		},
+		{
+			name: "returns error on non-200 status",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = fmt.Fprint(w, `{"message":"not found"}`)
+			},
+			wantErr: true,
+		},
+		{
+			name: "returns error on invalid JSON",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `not json`)
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := NewHTTPClient("test-token", srv.URL)
+			comments, err := client.ListComments(context.Background(), "owner", "repo", 1)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ListComments: %v", err)
+			}
+			if len(comments) != tc.wantCount {
+				t.Errorf("got %d comments, want %d", len(comments), tc.wantCount)
+			}
+		})
+	}
+}
+
+func TestListCommentsFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `[{"id":42,"body":"Hello world","user":{"login":"alice"},"created_at":"2025-06-15T10:30:00Z","html_url":"https://github.com/o/r/issues/1#issuecomment-42"}]`)
+	}))
+	defer srv.Close()
+
+	client := NewHTTPClient("test-token", srv.URL)
+	comments, err := client.ListComments(context.Background(), "o", "r", 1)
+	if err != nil {
+		t.Fatalf("ListComments: %v", err)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("got %d comments, want 1", len(comments))
+	}
+
+	c := comments[0]
+	if c.ID != 42 {
+		t.Errorf("ID = %d, want 42", c.ID)
+	}
+	if c.Body != "Hello world" {
+		t.Errorf("Body = %q, want %q", c.Body, "Hello world")
+	}
+	if c.User.Login != "alice" {
+		t.Errorf("User.Login = %q, want %q", c.User.Login, "alice")
+	}
+	if c.HTMLURL != "https://github.com/o/r/issues/1#issuecomment-42" {
+		t.Errorf("HTMLURL = %q, unexpected", c.HTMLURL)
+	}
+	wantTime := time.Date(2025, 6, 15, 10, 30, 0, 0, time.UTC)
+	if !c.CreatedAt.Equal(wantTime) {
+		t.Errorf("CreatedAt = %v, want %v", c.CreatedAt, wantTime)
+	}
+}
+
 func TestIsPullRequest(t *testing.T) {
 	tests := []struct {
 		name string

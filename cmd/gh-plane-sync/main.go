@@ -99,7 +99,10 @@ func run(args []string) int {
 	// Wire real sync cycle using the engine.
 	syncCycle = func(ctx context.Context, _ *config.Config, _ bool, l *log.Logger) {
 		if err := engine.SyncIssues(ctx); err != nil {
-			l.Error("sync cycle failed", "error", err)
+			l.Error("issue sync failed", "error", err)
+		}
+		if err := engine.SyncComments(ctx); err != nil {
+			l.Error("comment sync failed", "error", err)
 		}
 		l.LogSummary()
 		l.Reset()

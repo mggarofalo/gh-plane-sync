@@ -179,6 +179,95 @@ func TestCreateIssue(t *testing.T) {
 	}
 }
 
+func TestCreateComment(t *testing.T) {
+	tests := []struct {
+		name    string
+		issueID string
+		req     CreateCommentRequest
+		handler http.HandlerFunc
+		wantID  string
+		wantErr bool
+	}{
+		{
+			name:    "creates comment successfully",
+			issueID: "issue-uuid-1",
+			req: CreateCommentRequest{
+				CommentHTML: "<p>Synced from GitHub</p>",
+			},
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					t.Errorf("method = %s, want POST", r.Method)
+				}
+				if !strings.HasSuffix(r.URL.Path, "/api/v1/workspaces/ws/projects/proj-1/issues/issue-uuid-1/comments/") {
+					t.Errorf("path = %s, unexpected", r.URL.Path)
+				}
+				if r.Header.Get("X-API-Key") != "test-key" {
+					t.Errorf("X-API-Key = %q, want %q", r.Header.Get("X-API-Key"), "test-key")
+				}
+
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatalf("reading body: %v", err)
+				}
+				var req CreateCommentRequest
+				if err := json.Unmarshal(body, &req); err != nil {
+					t.Fatalf("unmarshaling body: %v", err)
+				}
+				if req.CommentHTML != "<p>Synced from GitHub</p>" {
+					t.Errorf("comment_html = %q, unexpected", req.CommentHTML)
+				}
+
+				w.WriteHeader(http.StatusCreated)
+				_, _ = fmt.Fprint(w, `{"id":"comment-uuid-1"}`)
+			},
+			wantID: "comment-uuid-1",
+		},
+		{
+			name:    "returns error on non-201 status",
+			issueID: "issue-uuid-1",
+			req:     CreateCommentRequest{CommentHTML: "<p>fail</p>"},
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = fmt.Fprint(w, `{"error":"bad request"}`)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "returns error on invalid JSON response",
+			issueID: "issue-uuid-1",
+			req:     CreateCommentRequest{CommentHTML: "<p>bad json</p>"},
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusCreated)
+				_, _ = fmt.Fprint(w, `not json`)
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := NewHTTPClient("test-key", srv.URL)
+			comment, err := client.CreateComment(context.Background(), "ws", "proj-1", tc.issueID, tc.req)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CreateComment: %v", err)
+			}
+			if comment.ID != tc.wantID {
+				t.Errorf("ID = %q, want %q", comment.ID, tc.wantID)
+			}
+		})
+	}
+}
+
 func TestUpdateIssue(t *testing.T) {
 	tests := []struct {
 		name    string
