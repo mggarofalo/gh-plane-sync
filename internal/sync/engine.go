@@ -395,23 +395,26 @@ func (e *Engine) syncIssueState(ctx context.Context, mapping config.Mapping, sta
 		return nil
 	}
 
-	// Close or reopen the GitHub issue.
+	// Close or reopen the GitHub issue. The state change is performed first
+	// so that a transient failure does not leave a misleading comment behind.
+	// If the state change succeeds but the comment fails, the next cycle will
+	// see matching states and skip the issue (no duplicate comments).
 	switch desiredGHState {
 	case "closed":
+		if err := e.github.CloseIssue(ctx, owner, repo, im.GitHubIssueNumber); err != nil {
+			return fmt.Errorf("closing %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
+		}
 		comment := fmt.Sprintf("Closed by Plane workflow (state: %s)", planeIssue.StateName)
 		if err := e.github.CreateComment(ctx, owner, repo, im.GitHubIssueNumber, comment); err != nil {
 			return fmt.Errorf("commenting on %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
 		}
-		if err := e.github.CloseIssue(ctx, owner, repo, im.GitHubIssueNumber); err != nil {
-			return fmt.Errorf("closing %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
-		}
 	case "open":
+		if err := e.github.ReopenIssue(ctx, owner, repo, im.GitHubIssueNumber); err != nil {
+			return fmt.Errorf("reopening %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
+		}
 		comment := fmt.Sprintf("Reopened by Plane workflow (state: %s)", planeIssue.StateName)
 		if err := e.github.CreateComment(ctx, owner, repo, im.GitHubIssueNumber, comment); err != nil {
 			return fmt.Errorf("commenting on %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
-		}
-		if err := e.github.ReopenIssue(ctx, owner, repo, im.GitHubIssueNumber); err != nil {
-			return fmt.Errorf("reopening %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
 		}
 	default:
 		e.logger.Warn("unknown desired GitHub state, skipping",
