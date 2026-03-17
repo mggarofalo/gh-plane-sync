@@ -38,6 +38,11 @@ func TestRun(t *testing.T) {
 		wantCode int
 	}{
 		{
+			name:     "help flag exits cleanly",
+			args:     []string{"--help"},
+			wantCode: 0,
+		},
+		{
 			name:     "version flag",
 			args:     []string{"--version"},
 			wantCode: 0,
