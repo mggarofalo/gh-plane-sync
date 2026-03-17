@@ -19,6 +19,10 @@ import (
 // GitHubClient is the subset of the GitHub API needed by the sync engine.
 type GitHubClient interface {
 	ListIssues(ctx context.Context, owner, repo string, since time.Time) ([]GitHubIssue, error)
+	GetIssue(ctx context.Context, owner, repo string, number int) (GitHubIssue, error)
+	CloseIssue(ctx context.Context, owner, repo string, number int) error
+	ReopenIssue(ctx context.Context, owner, repo string, number int) error
+	CreateComment(ctx context.Context, owner, repo string, number int, body string) error
 }
 
 // GitHubIssue mirrors the fields the engine needs from a GitHub issue.
@@ -33,6 +37,7 @@ type GitHubIssue struct {
 
 // PlaneClient is the subset of the Plane API needed by the sync engine.
 type PlaneClient interface {
+	GetIssue(ctx context.Context, workspaceSlug, projectID, issueID string) (PlaneIssue, error)
 	CreateIssue(ctx context.Context, workspaceSlug, projectID string, req CreatePlaneIssueRequest) (PlaneIssue, error)
 	UpdateIssue(ctx context.Context, workspaceSlug, projectID, issueID string, req UpdatePlaneIssueRequest) (PlaneIssue, error)
 }
@@ -42,6 +47,7 @@ type PlaneIssue struct {
 	ID              string
 	Name            string
 	DescriptionHTML string
+	StateName       string
 }
 
 // CreatePlaneIssueRequest contains the fields for creating a Plane work item.
@@ -276,6 +282,144 @@ func (e *Engine) updatePlaneIssue(ctx context.Context, mapping config.Mapping, i
 		CreatedAt:         existing.CreatedAt,
 	}); err != nil {
 		return fmt.Errorf("updating issue map for %s/%s#%d: %w", owner, repo, issue.Number, err)
+	}
+
+	return nil
+}
+
+// SyncStates runs one cycle of Plane-to-GitHub state synchronization.
+// For each configured mapping it:
+//  1. Lists all mapped issues from the store.
+//  2. Fetches the current Plane state for each mapped issue.
+//  3. Looks up the desired GitHub state in the plane_to_github mapping.
+//  4. Closes or reopens the GitHub issue as needed.
+//  5. Adds a comment on the GitHub issue explaining the state change.
+func (e *Engine) SyncStates(ctx context.Context) error {
+	for _, mapping := range e.cfg.Mappings {
+		if err := e.syncRepoStates(ctx, mapping); err != nil {
+			return fmt.Errorf("syncing states for %s/%s: %w", mapping.GitHub.Owner, mapping.GitHub.Repo, err)
+		}
+	}
+	return nil
+}
+
+// syncRepoStates processes state synchronization for a single mapping.
+func (e *Engine) syncRepoStates(ctx context.Context, mapping config.Mapping) error {
+	owner := mapping.GitHub.Owner
+	repo := mapping.GitHub.Repo
+	states := mapping.EffectiveStates(e.cfg.States)
+
+	e.logger.Info("starting state sync",
+		"owner", owner,
+		"repo", repo,
+		"plane_project", mapping.Plane.ProjectID,
+	)
+
+	issueMaps, err := e.store.ListIssueMaps(owner, repo)
+	if err != nil {
+		return fmt.Errorf("listing issue maps: %w", err)
+	}
+
+	e.logger.Debug("found mapped issues for state sync",
+		"owner", owner,
+		"repo", repo,
+		"count", len(issueMaps),
+	)
+
+	for _, im := range issueMaps {
+		if err := e.syncIssueState(ctx, mapping, states, im); err != nil {
+			e.logger.Error("failed to sync issue state",
+				"owner", owner,
+				"repo", repo,
+				"issue_number", im.GitHubIssueNumber,
+				"error", err,
+			)
+			// Continue syncing other issues rather than aborting the whole repo.
+			continue
+		}
+	}
+
+	return nil
+}
+
+// syncIssueState handles state synchronization for a single mapped issue.
+func (e *Engine) syncIssueState(ctx context.Context, mapping config.Mapping, states config.StateMappings, im store.IssueMap) error {
+	owner := mapping.GitHub.Owner
+	repo := mapping.GitHub.Repo
+
+	// Fetch current Plane state.
+	planeIssue, err := e.plane.GetIssue(ctx, e.cfg.Plane.Workspace, mapping.Plane.ProjectID, im.PlaneIssueID)
+	if err != nil {
+		return fmt.Errorf("fetching Plane issue %s: %w", im.PlaneIssueID, err)
+	}
+
+	// Look up the desired GitHub state from the Plane state name.
+	desiredGHState, ok := states.PlaneToGitHub[planeIssue.StateName]
+	if !ok {
+		e.logger.Debug("no plane_to_github mapping for state, skipping",
+			"owner", owner,
+			"repo", repo,
+			"issue_number", im.GitHubIssueNumber,
+			"plane_state", planeIssue.StateName,
+		)
+		return nil
+	}
+
+	// Fetch current GitHub issue state.
+	ghIssue, err := e.github.GetIssue(ctx, owner, repo, im.GitHubIssueNumber)
+	if err != nil {
+		return fmt.Errorf("fetching GitHub issue %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
+	}
+
+	// If the states already match, nothing to do.
+	if ghIssue.State == desiredGHState {
+		e.logger.LogAction(log.ActionSkipped, "GitHub issue already in desired state",
+			"owner", owner,
+			"repo", repo,
+			"issue_number", im.GitHubIssueNumber,
+			"state", ghIssue.State,
+		)
+		return nil
+	}
+
+	e.logger.LogAction(log.ActionStateChanged, "syncing state from Plane to GitHub",
+		"owner", owner,
+		"repo", repo,
+		"issue_number", im.GitHubIssueNumber,
+		"plane_state", planeIssue.StateName,
+		"github_current_state", ghIssue.State,
+		"github_desired_state", desiredGHState,
+	)
+
+	if e.logger.DryRun() {
+		return nil
+	}
+
+	// Close or reopen the GitHub issue.
+	switch desiredGHState {
+	case "closed":
+		comment := fmt.Sprintf("Closed by Plane workflow (state: %s)", planeIssue.StateName)
+		if err := e.github.CreateComment(ctx, owner, repo, im.GitHubIssueNumber, comment); err != nil {
+			return fmt.Errorf("commenting on %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
+		}
+		if err := e.github.CloseIssue(ctx, owner, repo, im.GitHubIssueNumber); err != nil {
+			return fmt.Errorf("closing %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
+		}
+	case "open":
+		comment := fmt.Sprintf("Reopened by Plane workflow (state: %s)", planeIssue.StateName)
+		if err := e.github.CreateComment(ctx, owner, repo, im.GitHubIssueNumber, comment); err != nil {
+			return fmt.Errorf("commenting on %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
+		}
+		if err := e.github.ReopenIssue(ctx, owner, repo, im.GitHubIssueNumber); err != nil {
+			return fmt.Errorf("reopening %s/%s#%d: %w", owner, repo, im.GitHubIssueNumber, err)
+		}
+	default:
+		e.logger.Warn("unknown desired GitHub state, skipping",
+			"owner", owner,
+			"repo", repo,
+			"issue_number", im.GitHubIssueNumber,
+			"desired_state", desiredGHState,
+		)
 	}
 
 	return nil

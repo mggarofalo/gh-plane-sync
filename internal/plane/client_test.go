@@ -11,6 +11,85 @@ import (
 	"testing"
 )
 
+func TestGetIssue(t *testing.T) {
+	tests := []struct {
+		name      string
+		issueID   string
+		handler   http.HandlerFunc
+		wantID    string
+		wantState string
+		wantErr   bool
+	}{
+		{
+			name:    "fetches issue with state",
+			issueID: "issue-uuid-1",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("method = %s, want GET", r.Method)
+				}
+				if !strings.Contains(r.URL.Path, "issue-uuid-1") {
+					t.Errorf("path = %s, missing issue ID", r.URL.Path)
+				}
+				if r.URL.Query().Get("expand") != "state" {
+					t.Errorf("expand = %q, want %q", r.URL.Query().Get("expand"), "state")
+				}
+				if r.Header.Get("X-API-Key") != "test-key" {
+					t.Errorf("X-API-Key = %q, want %q", r.Header.Get("X-API-Key"), "test-key")
+				}
+
+				w.WriteHeader(http.StatusOK)
+				_, _ = fmt.Fprint(w, `{"id":"issue-uuid-1","name":"Test issue","description_html":"<p>Desc</p>","state_detail":{"name":"Done","group":"completed"}}`)
+			},
+			wantID:    "issue-uuid-1",
+			wantState: "Done",
+		},
+		{
+			name:    "returns error on non-200 status",
+			issueID: "not-found",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = fmt.Fprint(w, `{"error":"not found"}`)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "returns error on invalid JSON",
+			issueID: "bad-json",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = fmt.Fprint(w, `not json`)
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := NewHTTPClient("test-key", srv.URL)
+			issue, err := client.GetIssue(context.Background(), "ws", "proj-1", tc.issueID)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetIssue: %v", err)
+			}
+			if issue.ID != tc.wantID {
+				t.Errorf("ID = %q, want %q", issue.ID, tc.wantID)
+			}
+			if issue.State.Name != tc.wantState {
+				t.Errorf("State.Name = %q, want %q", issue.State.Name, tc.wantState)
+			}
+		})
+	}
+}
+
 func TestCreateIssue(t *testing.T) {
 	tests := []struct {
 		name    string
