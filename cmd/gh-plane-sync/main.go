@@ -12,7 +12,11 @@ import (
 	"time"
 
 	"github.com/mggarofalo/gh-plane-sync/internal/config"
+	"github.com/mggarofalo/gh-plane-sync/internal/github"
 	"github.com/mggarofalo/gh-plane-sync/internal/log"
+	"github.com/mggarofalo/gh-plane-sync/internal/plane"
+	"github.com/mggarofalo/gh-plane-sync/internal/store"
+	"github.com/mggarofalo/gh-plane-sync/internal/sync"
 )
 
 // version and commit are set by ldflags at build time.
@@ -24,7 +28,7 @@ var (
 // syncCycle is the function called each tick. It is a package-level variable
 // so that tests can replace it with a stub.
 var syncCycle = func(_ context.Context, _ *config.Config, _ bool, _ *log.Logger) {
-	// Placeholder: sync logic will be implemented in later issues.
+	// Placeholder: replaced at runtime in run().
 }
 
 // run encapsulates the application logic so it can be tested. It returns an
@@ -50,11 +54,13 @@ func run(args []string) int {
 		return 0
 	}
 
-	if os.Getenv("GITHUB_TOKEN") == "" {
+	ghToken := os.Getenv("GITHUB_TOKEN")
+	if ghToken == "" {
 		fmt.Fprintln(os.Stderr, "error: GITHUB_TOKEN environment variable is required")
 		return 1
 	}
-	if os.Getenv("PLANE_API_KEY") == "" {
+	planeAPIKey := os.Getenv("PLANE_API_KEY")
+	if planeAPIKey == "" {
 		fmt.Fprintln(os.Stderr, "error: PLANE_API_KEY environment variable is required")
 		return 1
 	}
@@ -70,6 +76,34 @@ func run(args []string) int {
 		Level:  log.LevelInfo,
 		DryRun: *dryRun,
 	})
+
+	db, err := store.Open(cfg.DBPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	defer func() { _ = db.Close() }()
+
+	ghBaseURL := os.Getenv("GITHUB_API_BASE_URL") // empty → default (api.github.com)
+	ghClient := github.NewHTTPClient(ghToken, ghBaseURL)
+	planeClient := plane.NewHTTPClient(planeAPIKey, cfg.Plane.APIURL)
+
+	engine := sync.NewEngine(
+		sync.NewGitHubAdapter(ghClient),
+		sync.NewPlaneAdapter(planeClient),
+		db,
+		logger,
+		cfg,
+	)
+
+	// Wire real sync cycle using the engine.
+	syncCycle = func(ctx context.Context, _ *config.Config, _ bool, l *log.Logger) {
+		if err := engine.SyncIssues(ctx); err != nil {
+			l.Error("sync cycle failed", "error", err)
+		}
+		l.LogSummary()
+		l.Reset()
+	}
 
 	// --once: run a single sync cycle and exit.
 	if *once {
