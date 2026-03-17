@@ -5,6 +5,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -27,10 +28,20 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("creating database directory %s: %w", dir, err)
 	}
 
-	db, err := sql.Open("sqlite", path)
+	// Build a file: URI with a busy_timeout so that SQLite retries on
+	// lock contention instead of returning SQLITE_BUSY immediately.
+	dsn := fmt.Sprintf("file:%s?_busy_timeout=5000", url.PathEscape(path))
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening database at %s: %w", path, err)
 	}
+
+	// SQLite allows only one concurrent writer. Limit the pool to a
+	// single connection so that all operations are serialized and
+	// per-connection PRAGMAs (foreign_keys, journal_mode) apply
+	// consistently.
+	db.SetMaxOpenConns(1)
 
 	// Enable WAL mode for better concurrent read performance.
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
@@ -38,7 +49,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("enabling WAL mode: %w", err)
 	}
 
-	// Enable foreign keys.
+	// Enable foreign keys (per-connection setting in SQLite).
 	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("enabling foreign keys: %w", err)
