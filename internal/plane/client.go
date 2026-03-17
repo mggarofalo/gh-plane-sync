@@ -39,6 +39,16 @@ type UpdateIssueRequest struct {
 	DescriptionHTML string `json:"description_html,omitempty"`
 }
 
+// Comment represents a Plane issue comment.
+type Comment struct {
+	ID string `json:"id"`
+}
+
+// CreateCommentRequest contains the fields needed to create a Plane comment.
+type CreateCommentRequest struct {
+	CommentHTML string `json:"comment_html"`
+}
+
 // Client defines the interface for interacting with the Plane API.
 type Client interface {
 	// GetIssue fetches a single work item by ID, including its current
@@ -50,6 +60,9 @@ type Client interface {
 
 	// UpdateIssue updates an existing work item.
 	UpdateIssue(ctx context.Context, workspaceSlug, projectID, issueID string, req UpdateIssueRequest) (Issue, error)
+
+	// CreateComment creates a comment on a Plane work item.
+	CreateComment(ctx context.Context, workspaceSlug, projectID, issueID string, req CreateCommentRequest) (Comment, error)
 }
 
 // HTTPClient implements Client using the Plane REST API.
@@ -166,6 +179,40 @@ func (c *HTTPClient) UpdateIssue(ctx context.Context, workspaceSlug, projectID, 
 	}
 
 	return issue, nil
+}
+
+// CreateComment creates a comment on a Plane work item via the Plane API.
+func (c *HTTPClient) CreateComment(ctx context.Context, workspaceSlug, projectID, issueID string, req CreateCommentRequest) (Comment, error) {
+	url := fmt.Sprintf("%s/api/v1/workspaces/%s/projects/%s/issues/%s/comments/", c.baseURL, workspaceSlug, projectID, issueID)
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return Comment{}, fmt.Errorf("marshaling create comment request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return Comment{}, fmt.Errorf("creating HTTP request: %w", err)
+	}
+	c.setHeaders(httpReq)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return Comment{}, fmt.Errorf("executing create comment request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return Comment{}, fmt.Errorf("creating comment on issue %s: unexpected status %d: %s", issueID, resp.StatusCode, string(respBody))
+	}
+
+	var comment Comment
+	if err := json.NewDecoder(resp.Body).Decode(&comment); err != nil {
+		return Comment{}, fmt.Errorf("decoding create comment response: %w", err)
+	}
+
+	return comment, nil
 }
 
 // setHeaders adds the standard Plane API headers to a request.

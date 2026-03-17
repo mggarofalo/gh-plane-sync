@@ -26,6 +26,20 @@ type Issue struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// CommentUser represents the author of a GitHub comment.
+type CommentUser struct {
+	Login string `json:"login"`
+}
+
+// Comment represents a GitHub issue comment.
+type Comment struct {
+	ID        int         `json:"id"`
+	Body      string      `json:"body"`
+	User      CommentUser `json:"user"`
+	CreatedAt time.Time   `json:"created_at"`
+	HTMLURL   string      `json:"html_url"`
+}
+
 // Client defines the interface for interacting with the GitHub API.
 type Client interface {
 	// ListIssues fetches open issues for the given repository. If since is
@@ -44,6 +58,10 @@ type Client interface {
 
 	// CreateComment adds a comment to the given issue.
 	CreateComment(ctx context.Context, owner, repo string, number int, body string) error
+
+	// ListComments fetches all comments for the given issue. The
+	// implementation handles pagination transparently.
+	ListComments(ctx context.Context, owner, repo string, issueNumber int) ([]Comment, error)
 }
 
 // HTTPClient implements Client using the GitHub REST API v3.
@@ -257,6 +275,70 @@ var prURLPattern = regexp.MustCompile(`/pull/\d+$`)
 
 // linkNextRe matches the "next" relation in a GitHub Link header.
 var linkNextRe = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
+
+// ListComments fetches all comments for a GitHub issue, handling pagination.
+func (c *HTTPClient) ListComments(ctx context.Context, owner, repo string, issueNumber int) ([]Comment, error) {
+	var allComments []Comment
+	page := 1
+
+	for {
+		comments, nextPage, err := c.listCommentsPage(ctx, owner, repo, issueNumber, page)
+		if err != nil {
+			return nil, fmt.Errorf("fetching comments page %d for %s/%s#%d: %w", page, owner, repo, issueNumber, err)
+		}
+		allComments = append(allComments, comments...)
+
+		if nextPage == 0 {
+			break
+		}
+		page = nextPage
+	}
+
+	return allComments, nil
+}
+
+// listCommentsPage fetches a single page of comments and returns the next page
+// number (0 if there is no next page).
+func (c *HTTPClient) listCommentsPage(ctx context.Context, owner, repo string, issueNumber, page int) ([]Comment, int, error) {
+	u, err := url.Parse(fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", c.baseURL, owner, repo, issueNumber))
+	if err != nil {
+		return nil, 0, fmt.Errorf("parsing URL: %w", err)
+	}
+
+	q := u.Query()
+	q.Set("per_page", "100")
+	q.Set("page", strconv.Itoa(page))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("executing request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, 0, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var comments []Comment
+	if err := json.NewDecoder(resp.Body).Decode(&comments); err != nil {
+		return nil, 0, fmt.Errorf("decoding response: %w", err)
+	}
+
+	nextPage := parseNextPage(resp.Header.Get("Link"))
+	return comments, nextPage, nil
+}
 
 // parseNextPage extracts the next page number from a GitHub Link header.
 // Returns 0 if there is no next page.
