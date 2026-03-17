@@ -14,9 +14,17 @@ import (
 
 // Issue represents a Plane work item with the fields relevant to sync.
 type Issue struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	DescriptionHTML string `json:"description_html"`
+	ID              string     `json:"id"`
+	Name            string     `json:"name"`
+	DescriptionHTML string     `json:"description_html"`
+	State           IssueState `json:"state_detail"`
+}
+
+// IssueState represents the workflow state of a Plane issue as returned
+// by the API when using ?expand=state.
+type IssueState struct {
+	Name  string `json:"name"`
+	Group string `json:"group"`
 }
 
 // CreateIssueRequest contains the fields needed to create a Plane work item.
@@ -33,6 +41,10 @@ type UpdateIssueRequest struct {
 
 // Client defines the interface for interacting with the Plane API.
 type Client interface {
+	// GetIssue fetches a single work item by ID, including its current
+	// workflow state (expanded via ?expand=state).
+	GetIssue(ctx context.Context, workspaceSlug, projectID, issueID string) (Issue, error)
+
 	// CreateIssue creates a new work item in the given workspace and project.
 	CreateIssue(ctx context.Context, workspaceSlug, projectID string, req CreateIssueRequest) (Issue, error)
 
@@ -56,6 +68,36 @@ func NewHTTPClient(apiKey, baseURL string) *HTTPClient {
 		apiKey:     apiKey,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// GetIssue fetches a single work item by ID, including its current workflow
+// state via the ?expand=state query parameter.
+func (c *HTTPClient) GetIssue(ctx context.Context, workspaceSlug, projectID, issueID string) (Issue, error) {
+	reqURL := fmt.Sprintf("%s/api/v1/workspaces/%s/projects/%s/issues/%s/?expand=state", c.baseURL, workspaceSlug, projectID, issueID)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return Issue{}, fmt.Errorf("creating HTTP request: %w", err)
+	}
+	c.setHeaders(httpReq)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return Issue{}, fmt.Errorf("executing get request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return Issue{}, fmt.Errorf("getting issue %s: unexpected status %d: %s", issueID, resp.StatusCode, string(respBody))
+	}
+
+	var issue Issue
+	if err := json.NewDecoder(resp.Body).Decode(&issue); err != nil {
+		return Issue{}, fmt.Errorf("decoding get response: %w", err)
+	}
+
+	return issue, nil
 }
 
 // CreateIssue creates a work item via the Plane API.

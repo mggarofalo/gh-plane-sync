@@ -18,6 +18,38 @@ func NewGitHubAdapter(c github.Client) *GitHubAdapter {
 	return &GitHubAdapter{client: c}
 }
 
+// GetIssue fetches a single issue via the underlying GitHub client and
+// converts it to the sync package's GitHubIssue type.
+func (a *GitHubAdapter) GetIssue(ctx context.Context, owner, repo string, number int) (GitHubIssue, error) {
+	issue, err := a.client.GetIssue(ctx, owner, repo, number)
+	if err != nil {
+		return GitHubIssue{}, err
+	}
+	return GitHubIssue{
+		Number:    issue.Number,
+		Title:     issue.Title,
+		Body:      issue.Body,
+		State:     issue.State,
+		HTMLURL:   issue.HTMLURL,
+		UpdatedAt: issue.UpdatedAt,
+	}, nil
+}
+
+// CloseIssue closes a GitHub issue via the underlying client.
+func (a *GitHubAdapter) CloseIssue(ctx context.Context, owner, repo string, number int) error {
+	return a.client.CloseIssue(ctx, owner, repo, number)
+}
+
+// ReopenIssue reopens a GitHub issue via the underlying client.
+func (a *GitHubAdapter) ReopenIssue(ctx context.Context, owner, repo string, number int) error {
+	return a.client.ReopenIssue(ctx, owner, repo, number)
+}
+
+// CreateComment adds a comment to a GitHub issue via the underlying client.
+func (a *GitHubAdapter) CreateComment(ctx context.Context, owner, repo string, number int, body string) error {
+	return a.client.CreateComment(ctx, owner, repo, number, body)
+}
+
 // ListIssues fetches issues via the underlying GitHub client and converts
 // them to the sync package's GitHubIssue type.
 func (a *GitHubAdapter) ListIssues(ctx context.Context, owner, repo string, since time.Time) ([]GitHubIssue, error) {
@@ -49,6 +81,21 @@ type PlaneAdapter struct {
 // NewPlaneAdapter wraps a plane.Client for use with the sync engine.
 func NewPlaneAdapter(c plane.Client) *PlaneAdapter {
 	return &PlaneAdapter{client: c}
+}
+
+// GetIssue fetches a single issue via the underlying Plane client and
+// converts it to the sync package's PlaneIssue type.
+func (a *PlaneAdapter) GetIssue(ctx context.Context, workspaceSlug, projectID, issueID string) (PlaneIssue, error) {
+	issue, err := a.client.GetIssue(ctx, workspaceSlug, projectID, issueID)
+	if err != nil {
+		return PlaneIssue{}, err
+	}
+	return PlaneIssue{
+		ID:              issue.ID,
+		Name:            issue.Name,
+		DescriptionHTML: issue.DescriptionHTML,
+		StateName:       issue.State.Name,
+	}, nil
 }
 
 // CreateIssue creates an issue via the underlying Plane client and converts

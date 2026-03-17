@@ -17,8 +17,23 @@ import (
 
 // mockGitHubClient implements GitHubClient for testing.
 type mockGitHubClient struct {
-	issues map[string][]GitHubIssue // key: "owner/repo"
-	err    error
+	issues       map[string][]GitHubIssue // key: "owner/repo"
+	issuesByNum  map[string]GitHubIssue   // key: "owner/repo#number"
+	closedIssues []string                 // "owner/repo#number"
+	reopened     []string                 // "owner/repo#number"
+	comments     []commentCall
+	err          error
+	getIssueErr  error
+	closeErr     error
+	reopenErr    error
+	commentErr   error
+}
+
+type commentCall struct {
+	owner  string
+	repo   string
+	number int
+	body   string
 }
 
 func (m *mockGitHubClient) ListIssues(_ context.Context, owner, repo string, _ time.Time) ([]GitHubIssue, error) {
@@ -29,17 +44,68 @@ func (m *mockGitHubClient) ListIssues(_ context.Context, owner, repo string, _ t
 	return m.issues[key], nil
 }
 
+func (m *mockGitHubClient) GetIssue(_ context.Context, owner, repo string, number int) (GitHubIssue, error) {
+	if m.getIssueErr != nil {
+		return GitHubIssue{}, m.getIssueErr
+	}
+	key := fmt.Sprintf("%s/%s#%d", owner, repo, number)
+	issue, ok := m.issuesByNum[key]
+	if !ok {
+		return GitHubIssue{}, fmt.Errorf("issue not found: %s", key)
+	}
+	return issue, nil
+}
+
+func (m *mockGitHubClient) CloseIssue(_ context.Context, owner, repo string, number int) error {
+	if m.closeErr != nil {
+		return m.closeErr
+	}
+	key := fmt.Sprintf("%s/%s#%d", owner, repo, number)
+	m.closedIssues = append(m.closedIssues, key)
+	return nil
+}
+
+func (m *mockGitHubClient) ReopenIssue(_ context.Context, owner, repo string, number int) error {
+	if m.reopenErr != nil {
+		return m.reopenErr
+	}
+	key := fmt.Sprintf("%s/%s#%d", owner, repo, number)
+	m.reopened = append(m.reopened, key)
+	return nil
+}
+
+func (m *mockGitHubClient) CreateComment(_ context.Context, owner, repo string, number int, body string) error {
+	if m.commentErr != nil {
+		return m.commentErr
+	}
+	m.comments = append(m.comments, commentCall{owner: owner, repo: repo, number: number, body: body})
+	return nil
+}
+
 // mockPlaneClient implements PlaneClient for testing.
 type mockPlaneClient struct {
-	created []CreatePlaneIssueRequest
-	updated []updateCall
-	nextID  int
-	err     error
+	created     []CreatePlaneIssueRequest
+	updated     []updateCall
+	nextID      int
+	err         error
+	getIssueErr error
+	planeIssues map[string]PlaneIssue // key: issueID
 }
 
 type updateCall struct {
 	issueID string
 	req     UpdatePlaneIssueRequest
+}
+
+func (m *mockPlaneClient) GetIssue(_ context.Context, _, _, issueID string) (PlaneIssue, error) {
+	if m.getIssueErr != nil {
+		return PlaneIssue{}, m.getIssueErr
+	}
+	issue, ok := m.planeIssues[issueID]
+	if !ok {
+		return PlaneIssue{}, fmt.Errorf("plane issue not found: %s", issueID)
+	}
+	return issue, nil
 }
 
 func (m *mockPlaneClient) CreateIssue(_ context.Context, _, _ string, req CreatePlaneIssueRequest) (PlaneIssue, error) {
@@ -491,4 +557,468 @@ type mockGitHubClientWithSince struct {
 func (m *mockGitHubClientWithSince) ListIssues(_ context.Context, _, _ string, since time.Time) ([]GitHubIssue, error) {
 	*m.captureSince = since
 	return nil, nil
+}
+
+func (m *mockGitHubClientWithSince) GetIssue(_ context.Context, _, _ string, _ int) (GitHubIssue, error) {
+	return GitHubIssue{}, nil
+}
+
+func (m *mockGitHubClientWithSince) CloseIssue(_ context.Context, _, _ string, _ int) error {
+	return nil
+}
+
+func (m *mockGitHubClientWithSince) ReopenIssue(_ context.Context, _, _ string, _ int) error {
+	return nil
+}
+
+func (m *mockGitHubClientWithSince) CreateComment(_ context.Context, _, _ string, _ int, _ string) error {
+	return nil
+}
+
+// testStateConfig returns a config with full state mappings for state sync tests.
+func testStateConfig() *config.Config {
+	return &config.Config{
+		Plane: config.PlaneConfig{
+			APIURL:    "https://plane.example.com",
+			Workspace: "test-ws",
+		},
+		States: config.StateMappings{
+			GitHubToPlane: map[string]string{
+				"open":   "In Progress",
+				"closed": "Done",
+			},
+			PlaneToGitHub: map[string]string{
+				"Done":        "closed",
+				"Cancelled":   "closed",
+				"In Progress": "open",
+				"Backlog":     "open",
+			},
+		},
+		Mappings: []config.Mapping{
+			{
+				GitHub: config.GitHubRepo{Owner: "owner", Repo: "repo"},
+				Plane:  config.PlaneProject{ProjectID: "proj-1"},
+			},
+		},
+	}
+}
+
+func TestSyncStates(t *testing.T) {
+	tests := []struct {
+		name         string
+		seedMaps     []store.IssueMap
+		ghIssues     map[string]GitHubIssue // key: "owner/repo#number"
+		planeIssues  map[string]PlaneIssue  // key: plane issue ID
+		cfg          *config.Config
+		dryRun       bool
+		wantClosed   int
+		wantReopened int
+		wantComments int
+		wantErr      bool
+		ghGetErr     error
+		ghCloseErr   error
+		ghReopenErr  error
+		ghCommentErr error
+		plGetErr     error
+	}{
+		{
+			name: "closes GitHub issue when Plane state is Done",
+			seedMaps: []store.IssueMap{
+				{
+					GitHubOwner:       "owner",
+					GitHubRepo:        "repo",
+					GitHubIssueNumber: 1,
+					PlaneProjectID:    "proj-1",
+					PlaneIssueID:      "plane-1",
+				},
+			},
+			ghIssues: map[string]GitHubIssue{
+				"owner/repo#1": {Number: 1, State: "open"},
+			},
+			planeIssues: map[string]PlaneIssue{
+				"plane-1": {ID: "plane-1", StateName: "Done"},
+			},
+			cfg:          testStateConfig(),
+			wantClosed:   1,
+			wantComments: 1,
+		},
+		{
+			name: "closes GitHub issue when Plane state is Cancelled",
+			seedMaps: []store.IssueMap{
+				{
+					GitHubOwner:       "owner",
+					GitHubRepo:        "repo",
+					GitHubIssueNumber: 2,
+					PlaneProjectID:    "proj-1",
+					PlaneIssueID:      "plane-2",
+				},
+			},
+			ghIssues: map[string]GitHubIssue{
+				"owner/repo#2": {Number: 2, State: "open"},
+			},
+			planeIssues: map[string]PlaneIssue{
+				"plane-2": {ID: "plane-2", StateName: "Cancelled"},
+			},
+			cfg:          testStateConfig(),
+			wantClosed:   1,
+			wantComments: 1,
+		},
+		{
+			name: "reopens GitHub issue when Plane state maps to open",
+			seedMaps: []store.IssueMap{
+				{
+					GitHubOwner:       "owner",
+					GitHubRepo:        "repo",
+					GitHubIssueNumber: 3,
+					PlaneProjectID:    "proj-1",
+					PlaneIssueID:      "plane-3",
+				},
+			},
+			ghIssues: map[string]GitHubIssue{
+				"owner/repo#3": {Number: 3, State: "closed"},
+			},
+			planeIssues: map[string]PlaneIssue{
+				"plane-3": {ID: "plane-3", StateName: "In Progress"},
+			},
+			cfg:          testStateConfig(),
+			wantReopened: 1,
+			wantComments: 1,
+		},
+		{
+			name: "skips when GitHub state already matches",
+			seedMaps: []store.IssueMap{
+				{
+					GitHubOwner:       "owner",
+					GitHubRepo:        "repo",
+					GitHubIssueNumber: 4,
+					PlaneProjectID:    "proj-1",
+					PlaneIssueID:      "plane-4",
+				},
+			},
+			ghIssues: map[string]GitHubIssue{
+				"owner/repo#4": {Number: 4, State: "open"},
+			},
+			planeIssues: map[string]PlaneIssue{
+				"plane-4": {ID: "plane-4", StateName: "In Progress"},
+			},
+			cfg: testStateConfig(),
+		},
+		{
+			name: "skips when Plane state has no mapping",
+			seedMaps: []store.IssueMap{
+				{
+					GitHubOwner:       "owner",
+					GitHubRepo:        "repo",
+					GitHubIssueNumber: 5,
+					PlaneProjectID:    "proj-1",
+					PlaneIssueID:      "plane-5",
+				},
+			},
+			ghIssues: map[string]GitHubIssue{
+				"owner/repo#5": {Number: 5, State: "open"},
+			},
+			planeIssues: map[string]PlaneIssue{
+				"plane-5": {ID: "plane-5", StateName: "UnmappedState"},
+			},
+			cfg: testStateConfig(),
+		},
+		{
+			name:     "no mapped issues returns without error",
+			cfg:      testStateConfig(),
+			ghIssues: map[string]GitHubIssue{},
+		},
+		{
+			name: "dry run does not close or reopen",
+			seedMaps: []store.IssueMap{
+				{
+					GitHubOwner:       "owner",
+					GitHubRepo:        "repo",
+					GitHubIssueNumber: 6,
+					PlaneProjectID:    "proj-1",
+					PlaneIssueID:      "plane-6",
+				},
+			},
+			ghIssues: map[string]GitHubIssue{
+				"owner/repo#6": {Number: 6, State: "open"},
+			},
+			planeIssues: map[string]PlaneIssue{
+				"plane-6": {ID: "plane-6", StateName: "Done"},
+			},
+			cfg:    testStateConfig(),
+			dryRun: true,
+		},
+		{
+			name: "uses per-mapping state overrides",
+			seedMaps: []store.IssueMap{
+				{
+					GitHubOwner:       "owner",
+					GitHubRepo:        "repo",
+					GitHubIssueNumber: 7,
+					PlaneProjectID:    "proj-1",
+					PlaneIssueID:      "plane-7",
+				},
+			},
+			ghIssues: map[string]GitHubIssue{
+				"owner/repo#7": {Number: 7, State: "open"},
+			},
+			planeIssues: map[string]PlaneIssue{
+				"plane-7": {ID: "plane-7", StateName: "Deployed"},
+			},
+			cfg: &config.Config{
+				Plane: config.PlaneConfig{
+					APIURL:    "https://plane.example.com",
+					Workspace: "test-ws",
+				},
+				States: config.StateMappings{
+					GitHubToPlane: map[string]string{"open": "Backlog"},
+					PlaneToGitHub: map[string]string{"Backlog": "open"},
+				},
+				Mappings: []config.Mapping{
+					{
+						GitHub: config.GitHubRepo{Owner: "owner", Repo: "repo"},
+						Plane:  config.PlaneProject{ProjectID: "proj-1"},
+						States: &config.StateMappings{
+							GitHubToPlane: map[string]string{"closed": "Deployed"},
+							PlaneToGitHub: map[string]string{"Deployed": "closed"},
+						},
+					},
+				},
+			},
+			wantClosed:   1,
+			wantComments: 1,
+		},
+		{
+			name: "plane get error continues to next issue",
+			seedMaps: []store.IssueMap{
+				{
+					GitHubOwner:       "owner",
+					GitHubRepo:        "repo",
+					GitHubIssueNumber: 8,
+					PlaneProjectID:    "proj-1",
+					PlaneIssueID:      "plane-8",
+				},
+				{
+					GitHubOwner:       "owner",
+					GitHubRepo:        "repo",
+					GitHubIssueNumber: 9,
+					PlaneProjectID:    "proj-1",
+					PlaneIssueID:      "plane-9",
+				},
+			},
+			ghIssues: map[string]GitHubIssue{
+				"owner/repo#9": {Number: 9, State: "open"},
+			},
+			planeIssues: map[string]PlaneIssue{
+				// plane-8 is missing, will cause error via mock
+				"plane-9": {ID: "plane-9", StateName: "Done"},
+			},
+			cfg:          testStateConfig(),
+			wantClosed:   1,
+			wantComments: 1,
+		},
+		{
+			name: "multiple issues synced",
+			seedMaps: []store.IssueMap{
+				{
+					GitHubOwner:       "owner",
+					GitHubRepo:        "repo",
+					GitHubIssueNumber: 10,
+					PlaneProjectID:    "proj-1",
+					PlaneIssueID:      "plane-10",
+				},
+				{
+					GitHubOwner:       "owner",
+					GitHubRepo:        "repo",
+					GitHubIssueNumber: 11,
+					PlaneProjectID:    "proj-1",
+					PlaneIssueID:      "plane-11",
+				},
+			},
+			ghIssues: map[string]GitHubIssue{
+				"owner/repo#10": {Number: 10, State: "open"},
+				"owner/repo#11": {Number: 11, State: "closed"},
+			},
+			planeIssues: map[string]PlaneIssue{
+				"plane-10": {ID: "plane-10", StateName: "Done"},
+				"plane-11": {ID: "plane-11", StateName: "In Progress"},
+			},
+			cfg:          testStateConfig(),
+			wantClosed:   1,
+			wantReopened: 1,
+			wantComments: 2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			logger := testLogger(tc.dryRun)
+			gh := &mockGitHubClient{
+				issuesByNum: tc.ghIssues,
+				getIssueErr: tc.ghGetErr,
+				closeErr:    tc.ghCloseErr,
+				reopenErr:   tc.ghReopenErr,
+				commentErr:  tc.ghCommentErr,
+			}
+			pl := &mockPlaneClient{
+				planeIssues: tc.planeIssues,
+				getIssueErr: tc.plGetErr,
+			}
+
+			// Seed existing mappings.
+			for _, m := range tc.seedMaps {
+				if err := st.UpsertIssueMap(m); err != nil {
+					t.Fatalf("seeding issue map: %v", err)
+				}
+			}
+
+			engine := NewEngine(gh, pl, st, logger, tc.cfg)
+			err := engine.SyncStates(context.Background())
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SyncStates: %v", err)
+			}
+
+			if len(gh.closedIssues) != tc.wantClosed {
+				t.Errorf("closed %d issues, want %d", len(gh.closedIssues), tc.wantClosed)
+			}
+			if len(gh.reopened) != tc.wantReopened {
+				t.Errorf("reopened %d issues, want %d", len(gh.reopened), tc.wantReopened)
+			}
+			if len(gh.comments) != tc.wantComments {
+				t.Errorf("created %d comments, want %d", len(gh.comments), tc.wantComments)
+			}
+		})
+	}
+}
+
+func TestSyncStatesCommentContent(t *testing.T) {
+	st := testStore(t)
+	logger := testLogger(false)
+
+	if err := st.UpsertIssueMap(store.IssueMap{
+		GitHubOwner:       "owner",
+		GitHubRepo:        "repo",
+		GitHubIssueNumber: 1,
+		PlaneProjectID:    "proj-1",
+		PlaneIssueID:      "plane-1",
+	}); err != nil {
+		t.Fatalf("seeding issue map: %v", err)
+	}
+
+	gh := &mockGitHubClient{
+		issuesByNum: map[string]GitHubIssue{
+			"owner/repo#1": {Number: 1, State: "open"},
+		},
+	}
+	pl := &mockPlaneClient{
+		planeIssues: map[string]PlaneIssue{
+			"plane-1": {ID: "plane-1", StateName: "Done"},
+		},
+	}
+
+	engine := NewEngine(gh, pl, st, logger, testStateConfig())
+	if err := engine.SyncStates(context.Background()); err != nil {
+		t.Fatalf("SyncStates: %v", err)
+	}
+
+	if len(gh.comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(gh.comments))
+	}
+
+	want := "Closed by Plane workflow (state: Done)"
+	if gh.comments[0].body != want {
+		t.Errorf("comment body = %q, want %q", gh.comments[0].body, want)
+	}
+}
+
+func TestSyncStatesReopenCommentContent(t *testing.T) {
+	st := testStore(t)
+	logger := testLogger(false)
+
+	if err := st.UpsertIssueMap(store.IssueMap{
+		GitHubOwner:       "owner",
+		GitHubRepo:        "repo",
+		GitHubIssueNumber: 1,
+		PlaneProjectID:    "proj-1",
+		PlaneIssueID:      "plane-1",
+	}); err != nil {
+		t.Fatalf("seeding issue map: %v", err)
+	}
+
+	gh := &mockGitHubClient{
+		issuesByNum: map[string]GitHubIssue{
+			"owner/repo#1": {Number: 1, State: "closed"},
+		},
+	}
+	pl := &mockPlaneClient{
+		planeIssues: map[string]PlaneIssue{
+			"plane-1": {ID: "plane-1", StateName: "In Progress"},
+		},
+	}
+
+	engine := NewEngine(gh, pl, st, logger, testStateConfig())
+	if err := engine.SyncStates(context.Background()); err != nil {
+		t.Fatalf("SyncStates: %v", err)
+	}
+
+	if len(gh.comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(gh.comments))
+	}
+
+	want := "Reopened by Plane workflow (state: In Progress)"
+	if gh.comments[0].body != want {
+		t.Errorf("comment body = %q, want %q", gh.comments[0].body, want)
+	}
+}
+
+func TestSyncStatesDryRunCountsActions(t *testing.T) {
+	st := testStore(t)
+	logger := testLogger(true)
+
+	if err := st.UpsertIssueMap(store.IssueMap{
+		GitHubOwner:       "owner",
+		GitHubRepo:        "repo",
+		GitHubIssueNumber: 1,
+		PlaneProjectID:    "proj-1",
+		PlaneIssueID:      "plane-1",
+	}); err != nil {
+		t.Fatalf("seeding issue map: %v", err)
+	}
+
+	gh := &mockGitHubClient{
+		issuesByNum: map[string]GitHubIssue{
+			"owner/repo#1": {Number: 1, State: "open"},
+		},
+	}
+	pl := &mockPlaneClient{
+		planeIssues: map[string]PlaneIssue{
+			"plane-1": {ID: "plane-1", StateName: "Done"},
+		},
+	}
+
+	engine := NewEngine(gh, pl, st, logger, testStateConfig())
+	if err := engine.SyncStates(context.Background()); err != nil {
+		t.Fatalf("SyncStates: %v", err)
+	}
+
+	// Verify the state change action was counted even in dry-run mode.
+	counters := logger.Counters()
+	if counters[log.ActionStateChanged] != 1 {
+		t.Errorf("state_changed counter = %d, want 1", counters[log.ActionStateChanged])
+	}
+
+	// Verify no actual API calls were made.
+	if len(gh.closedIssues) != 0 {
+		t.Errorf("dry run should not close issues, got %d", len(gh.closedIssues))
+	}
+	if len(gh.comments) != 0 {
+		t.Errorf("dry run should not create comments, got %d", len(gh.comments))
+	}
 }

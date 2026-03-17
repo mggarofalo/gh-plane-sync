@@ -2,9 +2,12 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -205,6 +208,234 @@ func TestParseNextPage(t *testing.T) {
 			got := parseNextPage(tc.header)
 			if got != tc.want {
 				t.Errorf("parseNextPage(%q) = %d, want %d", tc.header, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGetIssue(t *testing.T) {
+	tests := []struct {
+		name      string
+		handler   http.HandlerFunc
+		wantState string
+		wantErr   bool
+	}{
+		{
+			name: "fetches open issue",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("method = %s, want GET", r.Method)
+				}
+				if !strings.HasSuffix(r.URL.Path, "/repos/owner/repo/issues/42") {
+					t.Errorf("path = %s, unexpected", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"number":42,"title":"Bug","body":"Fix it","state":"open","html_url":"https://github.com/owner/repo/issues/42","updated_at":"2025-01-01T00:00:00Z"}`)
+			},
+			wantState: "open",
+		},
+		{
+			name: "fetches closed issue",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"number":42,"title":"Bug","body":"Fix it","state":"closed","html_url":"https://github.com/owner/repo/issues/42","updated_at":"2025-01-01T00:00:00Z"}`)
+			},
+			wantState: "closed",
+		},
+		{
+			name: "returns error on non-200 status",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = fmt.Fprint(w, `{"message":"Not Found"}`)
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := NewHTTPClient("test-token", srv.URL)
+			issue, err := client.GetIssue(context.Background(), "owner", "repo", 42)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetIssue: %v", err)
+			}
+			if issue.State != tc.wantState {
+				t.Errorf("State = %q, want %q", issue.State, tc.wantState)
+			}
+		})
+	}
+}
+
+func TestCloseIssue(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		wantErr bool
+	}{
+		{
+			name: "closes issue successfully",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPatch {
+					t.Errorf("method = %s, want PATCH", r.Method)
+				}
+				body, _ := io.ReadAll(r.Body)
+				if !strings.Contains(string(body), `"state":"closed"`) {
+					t.Errorf("body = %s, want state:closed", string(body))
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"number":1,"state":"closed"}`)
+			},
+		},
+		{
+			name: "returns error on non-200 status",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_, _ = fmt.Fprint(w, `{"message":"Validation Failed"}`)
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := NewHTTPClient("test-token", srv.URL)
+			err := client.CloseIssue(context.Background(), "owner", "repo", 1)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CloseIssue: %v", err)
+			}
+		})
+	}
+}
+
+func TestReopenIssue(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		wantErr bool
+	}{
+		{
+			name: "reopens issue successfully",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPatch {
+					t.Errorf("method = %s, want PATCH", r.Method)
+				}
+				body, _ := io.ReadAll(r.Body)
+				if !strings.Contains(string(body), `"state":"open"`) {
+					t.Errorf("body = %s, want state:open", string(body))
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"number":1,"state":"open"}`)
+			},
+		},
+		{
+			name: "returns error on non-200 status",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_, _ = fmt.Fprint(w, `{"message":"Validation Failed"}`)
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := NewHTTPClient("test-token", srv.URL)
+			err := client.ReopenIssue(context.Background(), "owner", "repo", 1)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ReopenIssue: %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateComment(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		handler http.HandlerFunc
+		wantErr bool
+	}{
+		{
+			name: "creates comment successfully",
+			body: "Closed by Plane workflow",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					t.Errorf("method = %s, want POST", r.Method)
+				}
+				if !strings.HasSuffix(r.URL.Path, "/repos/owner/repo/issues/1/comments") {
+					t.Errorf("path = %s, unexpected", r.URL.Path)
+				}
+
+				reqBody, _ := io.ReadAll(r.Body)
+				var payload map[string]string
+				if err := json.Unmarshal(reqBody, &payload); err != nil {
+					t.Fatalf("unmarshaling body: %v", err)
+				}
+				if payload["body"] != "Closed by Plane workflow" {
+					t.Errorf("body = %q, want %q", payload["body"], "Closed by Plane workflow")
+				}
+
+				w.WriteHeader(http.StatusCreated)
+				_, _ = fmt.Fprint(w, `{"id":1,"body":"Closed by Plane workflow"}`)
+			},
+		},
+		{
+			name: "returns error on non-201 status",
+			body: "fail",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = fmt.Fprint(w, `{"message":"Not Found"}`)
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := NewHTTPClient("test-token", srv.URL)
+			err := client.CreateComment(context.Background(), "owner", "repo", 1, tc.body)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CreateComment: %v", err)
 			}
 		})
 	}
