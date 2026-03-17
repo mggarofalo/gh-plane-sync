@@ -562,6 +562,20 @@ func (e *Engine) syncIssueComments(ctx context.Context, mapping config.Mapping, 
 			continue
 		}
 
+		// Pre-insert a placeholder record before calling the Plane API.
+		// This prevents duplicate Plane comments if the API call succeeds
+		// but the subsequent store update fails: the placeholder ensures
+		// the next sync cycle sees the comment as already synced.
+		if err := e.store.UpsertSyncedComment(store.SyncedComment{
+			GitHubCommentID:   comment.ID,
+			PlaneCommentID:    "pending",
+			GitHubIssueNumber: im.GitHubIssueNumber,
+			GitHubOwner:       owner,
+			GitHubRepo:        repo,
+		}); err != nil {
+			return fmt.Errorf("pre-inserting synced comment %d: %w", comment.ID, err)
+		}
+
 		planeComment, err := e.plane.CreateComment(ctx, e.cfg.Plane.Workspace, mapping.Plane.ProjectID, im.PlaneIssueID, CreatePlaneCommentRequest{
 			CommentHTML: commentHTML,
 		})
@@ -569,6 +583,7 @@ func (e *Engine) syncIssueComments(ctx context.Context, mapping config.Mapping, 
 			return fmt.Errorf("creating Plane comment for GitHub comment %d: %w", comment.ID, err)
 		}
 
+		// Update the placeholder with the real Plane comment ID.
 		if err := e.store.UpsertSyncedComment(store.SyncedComment{
 			GitHubCommentID:   comment.ID,
 			PlaneCommentID:    planeComment.ID,
@@ -576,7 +591,15 @@ func (e *Engine) syncIssueComments(ctx context.Context, mapping config.Mapping, 
 			GitHubOwner:       owner,
 			GitHubRepo:        repo,
 		}); err != nil {
-			return fmt.Errorf("storing synced comment %d: %w", comment.ID, err)
+			// The Plane comment was already created, so log at error
+			// level but do not return: the placeholder record prevents
+			// duplicates on the next cycle.
+			e.logger.Error("failed to update synced comment record with Plane ID",
+				"github_comment_id", comment.ID,
+				"plane_comment_id", planeComment.ID,
+				"error", err,
+			)
+			continue
 		}
 
 		e.logger.Debug("synced comment",

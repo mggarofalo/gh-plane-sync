@@ -101,8 +101,10 @@ func run(args []string) int {
 		if err := engine.SyncIssues(ctx); err != nil {
 			l.Error("issue sync failed", "error", err)
 		}
-		if err := engine.SyncComments(ctx); err != nil {
-			l.Error("comment sync failed", "error", err)
+		if ctx.Err() == nil {
+			if err := engine.SyncComments(ctx); err != nil {
+				l.Error("comment sync failed", "error", err)
+			}
 		}
 		l.LogSummary()
 		l.Reset()

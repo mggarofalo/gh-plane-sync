@@ -18,17 +18,17 @@ import (
 
 // mockGitHubClient implements GitHubClient for testing.
 type mockGitHubClient struct {
-	issues        map[string][]GitHubIssue   // key: "owner/repo"
-	issuesByNum   map[string]GitHubIssue     // key: "owner/repo#number"
-	closedIssues  []string                   // "owner/repo#number"
-	reopened      []string                   // "owner/repo#number"
-	comments      map[string][]GitHubComment // key: "owner/repo#number" (for ListComments)
-	stateComments []commentCall              // (for CreateComment tracking)
-	err           error
-	getIssueErr   error
-	closeErr      error
-	reopenErr     error
-	commentErr    error // used by CreateComment (state sync)
+	issues         map[string][]GitHubIssue   // key: "owner/repo"
+	issuesByNum    map[string]GitHubIssue     // key: "owner/repo#number"
+	closedIssues   []string                   // "owner/repo#number"
+	reopened       []string                   // "owner/repo#number"
+	comments       map[string][]GitHubComment // key: "owner/repo#number" (for ListComments)
+	stateComments  []commentCall              // (for CreateComment tracking)
+	err            error
+	getIssueErr    error
+	closeErr       error
+	reopenErr      error
+	commentErr     error // used by CreateComment (state sync)
 	listCommentErr error // used by ListComments (comment sync)
 }
 
