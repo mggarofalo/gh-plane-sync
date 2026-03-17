@@ -1,7 +1,7 @@
 services:
   gh-plane-sync:
     image: ghcr.io/mggarofalo/gh-plane-sync:latest
-    restart: "no"
+    restart: unless-stopped
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - PLANE_API_KEY=${PLANE_API_KEY}

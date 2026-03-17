@@ -19,6 +19,8 @@ states:
     todo: "open"
     in_progress: "open"
 
+interval: "30m"  # sync interval (Go duration string, default: 30m, minimum: 1m)
+
 mappings:
   # Uses global state defaults
   - github:
@@ -74,6 +76,14 @@ Each entry maps one GitHub repo to one Plane project. A repo can only appear onc
 | `github.repo`          | string         | yes      | GitHub repo name                                     |
 | `plane.project_id`     | string         | yes      | Plane project UUID                                   |
 | `states`               | states object  | no       | Per-mapping state overrides (replaces global defaults)|
+
+### `interval`
+
+Sync interval as a Go duration string (e.g. `30m`, `1h`, `1h30m`, `90s`). Controls how often the daemon runs sync cycles when not using `--once`.
+
+| Type   | Required | Default | Minimum |
+|--------|----------|---------|---------|
+| string | no       | `30m`   | `1m`    |
 
 ### `db_path`
 
